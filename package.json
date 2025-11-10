@@ -1,0 +1,15 @@
+{
+  "name": "bulb-pricing",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "csv-writer": "^1.6.0",
+    "dotenv": "^16.4.5",
+    "msnodesqlv8": "^5.1.1",
+    "mssql": "^10.0.0"
+  }
+}
