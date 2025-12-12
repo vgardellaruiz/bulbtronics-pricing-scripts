@@ -215,7 +215,6 @@ function calculatePriceIndividual(product, catalogConfig)
 
 ```sql
 WITH CustomersWithIndividualPricing AS (
-    -- Gets customers with active CI special pricing
     SELECT DISTINCT sp.SPECPR_KEY as CUSTID
     FROM dbo.specpr sp
     WHERE sp.SPECPR_TYPE = 'CI'
@@ -224,32 +223,81 @@ WITH CustomersWithIndividualPricing AS (
         AND sp.SPECPR_EXPIRE_DATE > GETDATE()
 ),
 IndividualCatalogs AS (
-    -- One catalog per customer with CI pricing
-    SELECT 'INDIVIDUAL' as CatalogType, c.CUSTID as UniqueKey, ...
+    SELECT 
+        'INDIVIDUAL' as CatalogType,
+        c.CUSTID as UniqueKey,
+        c.CUSTID,
+        LTRIM(RTRIM(ISNULL(c.CUSTCATEGORY, ''))) AS CUSTCATEGORY,
+        LTRIM(RTRIM(ISNULL(c.CUSTPRICETIER, '0'))) AS CUSTPRICETIER,
+        ISNULL(c.CUSTPRICEMARKUP, 0) AS CUSTPRICEMARKUP,
+        LTRIM(RTRIM(ISNULL(c.CUSTGROUPCODE, ''))) AS CUSTGROUPCODE,
+        0 AS IS_MEMBER_NULL
     FROM dbo.cust c
     INNER JOIN CustomersWithIndividualPricing ci ON c.CUSTID = ci.CUSTID
-    WHERE c.CUSTMEMBERNUM IS NOT NULL
+    WHERE c.CUSTID IS NOT NULL
+        AND LTRIM(RTRIM(ISNULL(c.CUSTCATEGORY, ''))) <> ''
+        AND c.CUSTMEMBERNUM IS NOT NULL
 ),
 SharedCatalogs AS (
-    -- Distinct configurations for customers without CI
-    SELECT DISTINCT 'SHARED' as CatalogType,
-        CONCAT(CUSTCATEGORY,'|',CUSTPRICETIER,'|',CUSTPRICEMARKUP,'|',CUSTGROUPCODE,'|0') as UniqueKey, ...
+    SELECT DISTINCT
+        'SHARED' as CatalogType,
+        CONCAT(
+            LTRIM(RTRIM(ISNULL(c.CUSTCATEGORY, ''))), '|',
+            LTRIM(RTRIM(ISNULL(c.CUSTPRICETIER, '0'))), '|',
+            CAST(ISNULL(c.CUSTPRICEMARKUP, 0) AS VARCHAR(20)), '|',
+            LTRIM(RTRIM(ISNULL(c.CUSTGROUPCODE, ''))), '|',
+            '0'
+        ) as UniqueKey,
+        NULL as CUSTID,
+        LTRIM(RTRIM(ISNULL(c.CUSTCATEGORY, ''))) AS CUSTCATEGORY,
+        LTRIM(RTRIM(ISNULL(c.CUSTPRICETIER, '0'))) AS CUSTPRICETIER,
+        ISNULL(c.CUSTPRICEMARKUP, 0) AS CUSTPRICEMARKUP,
+        LTRIM(RTRIM(ISNULL(c.CUSTGROUPCODE, ''))) AS CUSTGROUPCODE,
+        0 AS IS_MEMBER_NULL
     FROM dbo.cust c
     LEFT JOIN CustomersWithIndividualPricing ci ON c.CUSTID = ci.CUSTID
-    WHERE ci.CUSTID IS NULL
+    WHERE c.CUSTID IS NOT NULL
+        AND ci.CUSTID IS NULL
+        AND LTRIM(RTRIM(ISNULL(c.CUSTCATEGORY, ''))) <> ''
         AND c.CUSTMEMBERNUM IS NOT NULL
 ),
 ProductCategories AS (
-    -- All product categories from pricat table
     SELECT DISTINCT LTRIM(RTRIM(PRICAT_CATEGORY)) AS PROD_CATEGORY
     FROM dbo.pricat
+    WHERE PRICAT_CATEGORY IS NOT NULL 
+        AND LTRIM(RTRIM(PRICAT_CATEGORY)) <> ''
+        AND PRICAT_CATEGORY <> 'NONE'
 ),
 AllCatalogs AS (
-    -- CROSS JOIN catalogs with categories for chunking
-    SELECT * FROM IndividualCatalogs CROSS JOIN ProductCategories
+    SELECT 
+        ic.CatalogType,
+        ic.UniqueKey,
+        ic.CUSTID,
+        ic.CUSTCATEGORY,
+        ic.CUSTPRICETIER,
+        ic.CUSTPRICEMARKUP,
+        ic.CUSTGROUPCODE,
+        ic.IS_MEMBER_NULL,
+        pc.PROD_CATEGORY
+    FROM IndividualCatalogs ic
+    CROSS JOIN ProductCategories pc
     UNION ALL
-    SELECT * FROM SharedCatalogs CROSS JOIN ProductCategories
+    SELECT 
+        sc.CatalogType,
+        sc.UniqueKey,
+        sc.CUSTID,
+        sc.CUSTCATEGORY,
+        sc.CUSTPRICETIER,
+        sc.CUSTPRICEMARKUP,
+        sc.CUSTGROUPCODE,
+        sc.IS_MEMBER_NULL,
+        pc.PROD_CATEGORY
+    FROM SharedCatalogs sc
+    CROSS JOIN ProductCategories pc
 )
+SELECT *
+FROM AllCatalogs
+ORDER BY CatalogType, UniqueKey, PROD_CATEGORY;
 ```
 
 **Key Features:**
@@ -274,28 +322,260 @@ AllCatalogs AS (
 
 **Filter:** Uses `@ProductCategory` to chunk by product category
 
-**Important Joins:**
+**Query:**
 ```sql
-LEFT JOIN dbo.price pr
+DECLARE @CustomerCategory VARCHAR(10) = {{record.CUSTCATEGORY}};
+DECLARE @CustomerTier VARCHAR(10) = {{record.CUSTPRICETIER}};
+DECLARE @CustomerMarkup DECIMAL(10,4) = {{record.CUSTPRICEMARKUP}};
+DECLARE @CustomerGroupCode VARCHAR(50) = {{record.CUSTGROUPCODE}};
+DECLARE @CustomerID VARCHAR(50) = {{record.CUSTID}};  -- NEW: Individual customer ID
+DECLARE @IsMemberNull BIT = {{record.IS_MEMBER_NULL}};
+DECLARE @ProductCategory VARCHAR(50) = {{record.PROD_CATEGORY}};
+
+DECLARE @EffectiveGroupCode VARCHAR(50);
+DECLARE @EffectiveCategory VARCHAR(10);
+DECLARE @EffectiveCustomerID VARCHAR(50);
+
+IF @IsMemberNull = 1 
+   OR (
+       (LTRIM(RTRIM(@CustomerCategory)) = '' OR @CustomerCategory IS NULL)
+       AND (LTRIM(RTRIM(@CustomerGroupCode)) = '' OR @CustomerGroupCode IS NULL)
+   )
+BEGIN
+    SET @EffectiveGroupCode = 'IHU';
+    SET @EffectiveCategory = 'WP2';
+    SET @EffectiveCustomerID = '106565';  -- Default customer ID
+END
+ELSE
+BEGIN
+    SET @EffectiveGroupCode = ISNULL(@CustomerGroupCode, '');
+    SET @EffectiveCategory = ISNULL(NULLIF(LTRIM(RTRIM(@CustomerCategory)), ''), 'WP2');
+    SET @EffectiveCustomerID = @CustomerID;
+END;
+
+WITH ProductsWithWH1 AS (
+    SELECT DISTINCT p.PROD_SKU
+    FROM dbo.Prod p
+    WHERE p.PROD_LOCATION = 1
+        AND (p.PROD_STATUS = 'N' OR (p.PROD_STATUS = 'D' AND p.RECD - p.USED > 0))
+        AND p.CATEGORY <> 'NONE'
+        AND p.PROD_SKU_CLASS = 'N'
+        AND LTRIM(RTRIM(p.CATEGORY)) = @ProductCategory  -- Filter by product category
+),
+RolledUpProducts AS (
+    SELECT 
+        MAX(CASE WHEN p.PROD_LOCATION = 1 THEN p.ID END) AS ID,
+        MAX(CASE WHEN p.PROD_LOCATION = 1 THEN p.CATEGORY END) AS CATEGORY,
+        p.PROD_SKU AS PROD_SKU,
+        MAX(CASE WHEN p.PROD_LOCATION = 1 THEN p.REF_COST END) AS REF_COST,
+        MAX(CASE WHEN p.PROD_LOCATION = 1 THEN p.PROD_MAX_SELLPRICE END) AS PROD_MAX_SELLPRICE,
+        MAX(CASE WHEN p.PROD_LOCATION = 1 THEN p.PROD_MAP_SELLPRICE END) AS PROD_MAP_SELLPRICE,
+        MAX(CASE WHEN p.PROD_LOCATION = 1 THEN p.PROD_MIN_SALE_UNIT END) AS PROD_MIN_SALE_UNIT
+    FROM dbo.Prod p
+    INNER JOIN ProductsWithWH1 wh1 ON p.PROD_SKU = wh1.PROD_SKU
+    WHERE (p.PROD_STATUS = 'N' OR (p.PROD_STATUS = 'D' AND p.RECD - p.USED > 0))
+        AND p.PROD_LOCATION IN (1, 2, 5, 7)
+        AND p.CATEGORY <> 'NONE'
+    GROUP BY p.PROD_SKU
+)
+SELECT 
+    rp.ID,
+    rp.PROD_SKU AS SKU,
+    LTRIM(RTRIM(rp.CATEGORY)) AS CATEGORY,
+    rp.REF_COST,
+    ISNULL(rp.PROD_MAX_SELLPRICE, 0) AS PROD_MAX_SELLPRICE,
+    ISNULL(rp.PROD_MAP_SELLPRICE, 0) AS PROD_MAP_SELLPRICE,
+    rp.PROD_MIN_SALE_UNIT,
+    
+    @EffectiveCategory AS CUSTCATEGORY,
+    @CustomerTier AS CUSTPRICETIER,
+    @CustomerMarkup AS CUSTPRICEMARKUP,
+    @EffectiveGroupCode AS CUSTGROUPCODE,
+    @EffectiveCustomerID AS CUSTID,
+    @IsMemberNull AS IS_MEMBER_NULL,
+    
+    pr.PRICE_DEFAULT_LEVEL,
+    pr.PRICE_SELECTIONS,
+    pr.PRICE_MARKUP1,
+    pr.PRICE_MARKUP2,
+    pr.PRICE_MARKUP3,
+    pr.PRICE_MARKUP4,
+    pr.PRICE_MARKUP5,
+    pr.PRICE_MARKUP6,
+    pr.PRICE_MARKUP7,
+    pr.PRICE_MARKUP8,
+    pr.PRICE_MARKUP9,
+    pr.PRICE_MARKUP10,
+    
+    prWP2.PRICE_DEFAULT_LEVEL AS WP2_PRICE_DEFAULT_LEVEL,
+    prWP2.PRICE_SELECTIONS AS WP2_PRICE_SELECTIONS,
+    prWP2.PRICE_MARKUP1 AS WP2_PRICE_MARKUP1,
+    prWP2.PRICE_MARKUP2 AS WP2_PRICE_MARKUP2,
+    prWP2.PRICE_MARKUP3 AS WP2_PRICE_MARKUP3,
+    prWP2.PRICE_MARKUP4 AS WP2_PRICE_MARKUP4,
+    prWP2.PRICE_MARKUP5 AS WP2_PRICE_MARKUP5,
+    prWP2.PRICE_MARKUP6 AS WP2_PRICE_MARKUP6,
+    prWP2.PRICE_MARKUP7 AS WP2_PRICE_MARKUP7,
+    prWP2.PRICE_MARKUP8 AS WP2_PRICE_MARKUP8,
+    prWP2.PRICE_MARKUP9 AS WP2_PRICE_MARKUP9,
+    prWP2.PRICE_MARKUP10 AS WP2_PRICE_MARKUP10,
+    
+    spCI.SPECPR_PRICE AS CI_SPECIAL_PRICE,  -- Customer Individual pricing
+    spGP.SPECPR_PRICE AS GP_SPECIAL_PRICE   -- Group pricing
+    
+FROM RolledUpProducts rp
+LEFT JOIN dbo.price pr 
     ON LTRIM(RTRIM(pr.PRICE_PROD_CAT)) = LTRIM(RTRIM(rp.CATEGORY))
     AND pr.price_cust_cat = @EffectiveCategory
-
 LEFT JOIN dbo.price prWP2
-    ON LTRIM(RTRIM(prWP2.PRICE_PROD_CAT)) = 'WP2'
-    AND prWP2.price_cust_cat = @EffectiveCategory
-
+    ON LTRIM(RTRIM(prWP2.PRICE_PROD_CAT)) = 'WP2'  -- Original C# logic
+    AND prWP2.price_cust_cat = @EffectiveCategory   -- Customer's category
 LEFT JOIN dbo.specpr spCI
     ON spCI.SPECPR_TYPE = 'CI'
     AND LTRIM(RTRIM(spCI.SPECPR_SKU)) = rp.PROD_SKU
-    AND spCI.SPECPR_KEY = @EffectiveCustomerID
+    AND spCI.SPECPR_KEY = @EffectiveCustomerID  -- Individual customer
+    AND spCI.SPECPR_APPROVER IS NOT NULL
+    AND LTRIM(RTRIM(spCI.SPECPR_APPROVER)) <> ''
     AND spCI.SPECPR_EXPIRE_DATE > GETDATE()
-
 LEFT JOIN dbo.specpr spGP
     ON spGP.SPECPR_TYPE = 'GP'
     AND LTRIM(RTRIM(spGP.SPECPR_SKU)) = rp.PROD_SKU
     AND spGP.SPECPR_KEY = @EffectiveGroupCode
+    AND spGP.SPECPR_APPROVER IS NOT NULL
+    AND LTRIM(RTRIM(spGP.SPECPR_APPROVER)) <> ''
     AND spGP.SPECPR_EXPIRE_DATE > GETDATE()
+    AND @EffectiveGroupCode <> ''
+WHERE rp.REF_COST IS NOT NULL
+ORDER BY rp.PROD_SKU;
 ```
+
+## Product Data Query (Individual Catalogs)
+Similar to the query for Individual catalogs bot doesn't consider special prices.
+
+**Includes:**
+- Product fields (SKU, CATEGORY, REF_COST, MAX, MAP)
+- Customer parameters (CUSTID, CATEGORY, TIER, MARKUP, GROUP)
+- Price table joins:
+  - Customer category pricing (pr join)
+  - WP2 reference pricing (prWP2 join)
+
+**Filter:** Uses `@ProductCategory` to chunk by product category
+
+**Query:**
+```sql
+DECLARE @CustomerCategory VARCHAR(10) = {{record.CUSTCATEGORY}};
+DECLARE @CustomerTier VARCHAR(10) = {{record.CUSTPRICETIER}};
+DECLARE @CustomerMarkup DECIMAL(10,4) = {{record.CUSTPRICEMARKUP}};
+DECLARE @CustomerGroupCode VARCHAR(50) = {{record.CUSTGROUPCODE}};
+DECLARE @IsMemberNull BIT = {{record.IS_MEMBER_NULL}};
+DECLARE @ProductCategory VARCHAR(50) = {{record.PROD_CATEGORY}};
+
+DECLARE @EffectiveGroupCode VARCHAR(50);
+DECLARE @EffectiveCategory VARCHAR(10);
+
+IF @IsMemberNull = 1 
+   OR (
+       (LTRIM(RTRIM(@CustomerCategory)) = '' OR @CustomerCategory IS NULL)
+       AND (LTRIM(RTRIM(@CustomerGroupCode)) = '' OR @CustomerGroupCode IS NULL)
+   )
+BEGIN
+    SET @EffectiveGroupCode = 'IHU';
+    SET @EffectiveCategory = 'WP2';
+END
+ELSE
+BEGIN
+    SET @EffectiveGroupCode = ISNULL(@CustomerGroupCode, '');
+    SET @EffectiveCategory = ISNULL(NULLIF(LTRIM(RTRIM(@CustomerCategory)), ''), 'WP2');
+END;
+
+WITH ProductsWithWH1 AS (
+    SELECT DISTINCT p.PROD_SKU
+    FROM dbo.Prod p
+    WHERE p.PROD_LOCATION = 1
+        AND (p.PROD_STATUS = 'N' OR (p.PROD_STATUS = 'D' AND p.RECD - p.USED > 0))
+        AND p.CATEGORY <> 'NONE'
+        AND p.PROD_SKU_CLASS = 'N'
+        AND LTRIM(RTRIM(p.CATEGORY)) = @ProductCategory  -- Filter by product category
+),
+RolledUpProducts AS (
+    SELECT 
+        MAX(CASE WHEN p.PROD_LOCATION = 1 THEN p.ID END) AS ID,
+        MAX(CASE WHEN p.PROD_LOCATION = 1 THEN p.CATEGORY END) AS CATEGORY,
+        p.PROD_SKU AS PROD_SKU,
+        MAX(CASE WHEN p.PROD_LOCATION = 1 THEN p.REF_COST END) AS REF_COST,
+        MAX(CASE WHEN p.PROD_LOCATION = 1 THEN p.PROD_MAX_SELLPRICE END) AS PROD_MAX_SELLPRICE,
+        MAX(CASE WHEN p.PROD_LOCATION = 1 THEN p.PROD_MAP_SELLPRICE END) AS PROD_MAP_SELLPRICE,
+        MAX(CASE WHEN p.PROD_LOCATION = 1 THEN p.PROD_MIN_SALE_UNIT END) AS PROD_MIN_SALE_UNIT
+    FROM dbo.Prod p
+    INNER JOIN ProductsWithWH1 wh1 ON p.PROD_SKU = wh1.PROD_SKU
+    WHERE (p.PROD_STATUS = 'N' OR (p.PROD_STATUS = 'D' AND p.RECD - p.USED > 0))
+        AND p.PROD_LOCATION IN (1, 2, 5, 7)
+        AND p.CATEGORY <> 'NONE'
+    GROUP BY p.PROD_SKU
+)
+SELECT 
+    rp.ID,
+    rp.PROD_SKU AS SKU,
+    LTRIM(RTRIM(rp.CATEGORY)) AS CATEGORY,
+    rp.REF_COST,
+    ISNULL(rp.PROD_MAX_SELLPRICE, 0) AS PROD_MAX_SELLPRICE,
+    ISNULL(rp.PROD_MAP_SELLPRICE, 0) AS PROD_MAP_SELLPRICE,
+    rp.PROD_MIN_SALE_UNIT,
+    
+    @EffectiveCategory AS CUSTCATEGORY,
+    @CustomerTier AS CUSTPRICETIER,
+    @CustomerMarkup AS CUSTPRICEMARKUP,
+    @EffectiveGroupCode AS CUSTGROUPCODE,
+    @IsMemberNull AS IS_MEMBER_NULL,
+    
+    pr.PRICE_DEFAULT_LEVEL,
+    pr.PRICE_SELECTIONS,
+    pr.PRICE_MARKUP1,
+    pr.PRICE_MARKUP2,
+    pr.PRICE_MARKUP3,
+    pr.PRICE_MARKUP4,
+    pr.PRICE_MARKUP5,
+    pr.PRICE_MARKUP6,
+    pr.PRICE_MARKUP7,
+    pr.PRICE_MARKUP8,
+    pr.PRICE_MARKUP9,
+    pr.PRICE_MARKUP10,
+    
+    prWP2.PRICE_DEFAULT_LEVEL AS WP2_PRICE_DEFAULT_LEVEL,
+    prWP2.PRICE_SELECTIONS AS WP2_PRICE_SELECTIONS,
+    prWP2.PRICE_MARKUP1 AS WP2_PRICE_MARKUP1,
+    prWP2.PRICE_MARKUP2 AS WP2_PRICE_MARKUP2,
+    prWP2.PRICE_MARKUP3 AS WP2_PRICE_MARKUP3,
+    prWP2.PRICE_MARKUP4 AS WP2_PRICE_MARKUP4,
+    prWP2.PRICE_MARKUP5 AS WP2_PRICE_MARKUP5,
+    prWP2.PRICE_MARKUP6 AS WP2_PRICE_MARKUP6,
+    prWP2.PRICE_MARKUP7 AS WP2_PRICE_MARKUP7,
+    prWP2.PRICE_MARKUP8 AS WP2_PRICE_MARKUP8,
+    prWP2.PRICE_MARKUP9 AS WP2_PRICE_MARKUP9,
+    prWP2.PRICE_MARKUP10 AS WP2_PRICE_MARKUP10,
+    
+    spGP.SPECPR_PRICE AS GP_SPECIAL_PRICE,
+    NULL AS CI_SPECIAL_PRICE
+    
+FROM RolledUpProducts rp
+LEFT JOIN dbo.price pr 
+    ON LTRIM(RTRIM(pr.PRICE_PROD_CAT)) = LTRIM(RTRIM(rp.CATEGORY))
+    AND pr.price_cust_cat = @EffectiveCategory
+LEFT JOIN dbo.price prWP2
+    ON LTRIM(RTRIM(prWP2.PRICE_PROD_CAT)) = 'WP2'  -- CHANGED: Original C# logic
+    AND prWP2.price_cust_cat = @EffectiveCategory   -- CHANGED: Customer's category
+LEFT JOIN dbo.specpr spGP
+    ON spGP.SPECPR_TYPE = 'GP'
+    AND LTRIM(RTRIM(spGP.SPECPR_SKU)) = rp.PROD_SKU
+    AND spGP.SPECPR_KEY = @EffectiveGroupCode
+    AND spGP.SPECPR_APPROVER IS NOT NULL
+    AND LTRIM(RTRIM(spGP.SPECPR_APPROVER)) <> ''
+    AND spGP.SPECPR_EXPIRE_DATE > GETDATE()
+    AND @EffectiveGroupCode <> ''
+WHERE rp.REF_COST IS NOT NULL
+ORDER BY rp.PROD_SKU;
+```
+
 
 ---
 
@@ -563,3 +843,4 @@ WHERE sp.SPECPR_TYPE = 'GP'
 1. Shopify API update capabilities (individual prices vs full price list replacement)
 2. Current API implementation details (mutations used, deletion strategy)
 3. Root cause of 11-minute catalog creation time
+
