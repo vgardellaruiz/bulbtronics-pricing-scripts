@@ -227,8 +227,8 @@ export async function getPrice({
 
   // 3) Marca comparativa "WP2"
   const qbprodmarkup = await getProdMarkup({
-    inProdCat: "WP2",
-    custCategory: custcategory,
+    inProdCat: category,
+    custCategory: "WP2",
     PRICETIER,
     PRICEMARKUP,
   });
