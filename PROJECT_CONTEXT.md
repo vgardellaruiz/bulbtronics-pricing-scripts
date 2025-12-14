@@ -746,6 +746,297 @@ WHERE sp.SPECPR_TYPE = 'GP'
 
 ---
 
+## Celigo Flow Architecture
+
+### Flow 1: New Catalog Creation
+- **Frequency:** Weekly or on-demand
+- **Purpose:** Create new catalogs that don't exist yet in Shopify
+- **Trigger:** Manual or scheduled
+- **Process:**
+  1. Run catalog configuration query (same as Flow 2 Query 1)
+  2. Check if catalog exists in Shopify by catalog title
+  3. If doesn't exist → Create empty catalog + price list
+  4. Populate with all products (35,000 products)
+  5. Calculate prices using JavaScript functions
+  6. Upload to Shopify via `priceListFixedPricesAdd` (batched 250 per call)
+  7. Set quantity rules via `quantityRulesAdd`
+
+**Notes:**
+- Currently functional in Celigo
+- Takes ~11 minutes per catalog
+- Creates complete, ready-to-use catalogs
+- Customer configuration changes (CUSTCATEGORY, TIER, MARKUP, GROUP) are handled by separate customer/company sync flow
+
+---
+
+### Flow 2: Update Product Prices (Incremental Updates)
+
+**⚠️ DIFFERENT FROM Flow 1 - This updates existing catalogs only**
+
+#### **Overview**
+- **Frequency:** Every 2-4 hours (scheduled)
+- **Purpose:** Update existing catalog prices when products/special prices/markup formulas change
+- **Strategy:** Detect changes, determine minimal scope, update only what's needed
+- **Performance:** ~50x faster than full regeneration by updating only changed SKUs
+
+#### **Shopify API Capabilities (Confirmed)**
+- ✅ CAN update individual product prices without recreating entire price list
+- ✅ Uses `priceListFixedPricesAdd` mutation (links by product variant ID)
+- ✅ Uses `quantityRulesAdd` for quantity rules
+- ✅ Batching: 250 prices per mutation call
+- ✅ Enables surgical SKU-level updates
+
+#### **Performance Context**
+- **Total:** 35,000 active products across 62 product categories
+- **Catalogs:** 1,150 catalogs (Individual + Shared)
+- **Processing time:** 2-4 hours acceptable for incremental updates
+- **Timestamp tracking:** Celigo provides @LastRunDate
+
+---
+
+### Flow 2 Detailed Structure
+
+#### **Step 1: Get All Catalog Sections**
+
+**Query 1: Catalog Configuration Query (Divided by Product Category)**
+
+Same query as new catalog creation, returns catalog configurations cross-joined with product categories for efficient batching.
+
+**Output:** ~71,000 rows (1,150 catalogs × 62 categories)
+
+**Example record:**
+```json
+{
+  "CatalogType": "SHARED",
+  "UniqueKey": "A2|0|0|...|0",
+  "CUSTID": null,
+  "CUSTCATEGORY": "A2",
+  "CUSTPRICETIER": "0",
+  "CUSTPRICEMARKUP": 0,
+  "CUSTGROUPCODE": "...",
+  "IS_MEMBER_NULL": 0,
+  "PROD_CATEGORY": "ADAP"
+}
+```
+
+**Key fields:**
+- `CatalogType`: INDIVIDUAL or SHARED
+- `UniqueKey`: Catalog identifier
+- `CUSTID`: Customer ID (for Individual), NULL (for Shared)
+- `CUSTCATEGORY`: Customer category (e.g., "A2", "JD1", "WP2")
+- `CUSTPRICETIER`: Tier 0-10 (selects which markup column to use)
+- `CUSTPRICEMARKUP`: Customer-specific markup adjustment
+- `CUSTGROUPCODE`: Buying group code
+- `PROD_CATEGORY`: Product category for this processing chunk
+
+---
+
+#### **Step 2: Check Changes Since Last Run**
+
+**Query 2: Change Detection Query**
+
+For each catalog section from Query 1, check if any changes affect it.
+
+**Input parameters:**
+- `@LastRunDate` - From Celigo timestamp tracking
+- `@CatalogType` - From catalog section
+- `@CUSTID` - From catalog section
+- `@CUSTCATEGORY` - From catalog section
+- `@CUSTGROUPCODE` - From catalog section
+- `@PROD_CATEGORY` - From catalog section
+
+**Output:**
+```json
+{
+  "PriceFormulaChanged": 0,
+  "ProductsChanged": 1,
+  "CI_Changed": 0,
+  "GP_Changed": 0,
+  "NeedsUpdate": 1,
+  "UpdateScope": "SKU"
+}
+```
+
+**Field meanings:**
+- `PriceFormulaChanged`: PRICE table markup formula changed (affects entire category)
+- `ProductsChanged`: Product fields changed (REF_COST, MAX, MAP, CATEGORY)
+- `CI_Changed`: Customer Individual special prices changed
+- `GP_Changed`: Group special prices changed
+- `NeedsUpdate`: 1 = process this section, 0 = skip
+- `UpdateScope`: 'CATEGORY' = update all products, 'SKU' = update only changed SKUs
+
+**Update Scope Logic:**
+- If `PriceFormulaChanged = 1` → `UpdateScope = 'CATEGORY'` (PRICE change affects all products)
+- Otherwise → `UpdateScope = 'SKU'` (only specific SKUs changed)
+
+---
+
+#### **Change Detection Sources (4 Types)**
+
+**1. Product Changes (SKU-level, Daily)**
+- Detects: `Prod.___TimeStampUpdated > @LastRunDate`
+- Filters: `CATEGORY = @PROD_CATEGORY` AND active status
+- Impact: All catalogs need those SKUs updated
+- Note: Timestamp fires for ANY field change (inventory, status, etc.), not just pricing fields
+
+**2. CI Special Price Changes (SKU-level, Daily) - 4 Sub-sources**
+
+**A. New/Modified (Timestamp-based):**
+```sql
+SPECPR_TYPE = 'CI' AND ___TimeStampUpdated > @LastRunDate
+AND SPECPR_EXPIRE_DATE > GETDATE()
+```
+
+**B. Expiring (Date-based - ⚠️ NO timestamp):**
+```sql
+SPECPR_TYPE = 'CI' AND SPECPR_EXPIRE_DATE BETWEEN @LastRunDate AND GETDATE()
+```
+
+**C. Starting (Date-based):**
+```sql
+SPECPR_TYPE = 'CI' AND SPECPR_START_DATE BETWEEN @LastRunDate AND GETDATE()
+AND SPECPR_EXPIRE_DATE > GETDATE()
+```
+
+**D. Deleted (Audit table):**
+```sql
+TableName = 'SPECPR' AND Key1 = 'CI' AND ___TimeStampUpdated > @LastRunDate
+```
+
+**3. GP Special Price Changes (SKU-level, Daily) - 4 Sub-sources**
+Same structure as CI but `SPECPR_TYPE = 'GP'`
+
+**4. PRICE Table Changes (Category-level, Rare <annually)**
+```sql
+price.___TimeStampUpdated > @LastRunDate
+WHERE PRICE_PROD_CAT = @PROD_CATEGORY AND price_cust_cat = @CUSTCATEGORY
+```
+
+**Why CUSTPRICETIER is NOT checked:**
+- PRICE table has ONE row per (PRICE_PROD_CAT, price_cust_cat)
+- That row contains ALL tier markups (PRICE_MARKUP1 through PRICE_MARKUP10)
+- Tier selects WHICH column to use, but if the row changes, ALL tiers are affected
+- Example: If PRICE_MARKUP2 changes, tier 2 catalogs need updating, but we can't know which column changed, so update all tiers
+
+---
+
+#### **Step 3: Branching Logic**
+
+**Branch Point 1: NeedsUpdate?**
+```
+if NeedsUpdate = 0 → SKIP (go to next catalog section)
+if NeedsUpdate = 1 → Proceed to Branch Point 2
+```
+
+**Branch Point 2: UpdateScope?**
+```
+if UpdateScope = 'CATEGORY' → PATH A (Full Category Update)
+if UpdateScope = 'SKU' → PATH B (Specific SKUs Only)
+```
+
+---
+
+#### **Step 4A: PATH A - Full Category Update**
+
+**When triggered:**
+- `PriceFormulaChanged = 1` (PRICE table markup changed)
+- Any mix that includes PRICE change
+
+**Why full category:**
+- Markup formula affects ALL products in category
+- Cannot optimize to specific SKUs
+
+**Process:**
+1. Use existing product query (Individual or Shared based on CatalogType)
+2. Fetch ALL products in `@PROD_CATEGORY` (~500-1,000 products)
+3. Calculate prices for all using JavaScript functions
+4. Update Shopify via `priceListFixedPricesAdd` (batched 250 per call)
+
+**Example result:**
+```json
+{
+  "PriceFormulaChanged": 1,
+  "ProductsChanged": 0,
+  "NeedsUpdate": 1,
+  "UpdateScope": "CATEGORY"
+}
+```
+
+---
+
+#### **Step 4B: PATH B - Specific SKUs Only** ⚡
+
+**When triggered:**
+- `ProductsChanged = 1` AND `PriceFormulaChanged = 0`
+- `CI_Changed = 1` AND `PriceFormulaChanged = 0`
+- `GP_Changed = 1` AND `PriceFormulaChanged = 0`
+- Any SKU-level change without PRICE formula change
+
+**Why specific SKUs:**
+- Only specific products changed
+- Can optimize by fetching/updating only those (5-50 SKUs vs 500-1,000)
+
+**Process:**
+1. **Query 3:** Get list of changed SKUs for this catalog section
+2. Use modified product query (filtered by SKU list)
+3. Fetch ONLY those SKUs' product data
+4. Calculate prices for only those SKUs
+5. Update Shopify via `priceListFixedPricesAdd` (batched 250 per call)
+
+**Performance improvement:**
+- Before: Update 1,150 catalogs × 500 DEUT products = 575,000 price updates
+- After: Update 1,150 catalogs × 10 changed SKUs = 11,500 price updates
+- **~50x faster!** 🚀
+
+**Example result:**
+```json
+{
+  "PriceFormulaChanged": 0,
+  "ProductsChanged": 1,
+  "NeedsUpdate": 1,
+  "UpdateScope": "SKU"
+}
+```
+
+---
+
+### Flow 2 Query Summary
+
+**Queries Used:**
+
+1. ✅ **Query 1:** Get all catalog sections (divided by product category) - EXISTS
+2. ✅ **Query 2:** Check changes for specific catalog section - CREATED
+3. ⏳ **Query 3:** Get changed SKUs list (for PATH B) - PENDING
+4. ✅ **Query 4A:** Fetch all products - SHARED (full category) - EXISTS
+5. ✅ **Query 4B:** Fetch all products - INDIVIDUAL (full category) - EXISTS
+6. ⏳ **Query 5A:** Fetch specific SKUs - SHARED (filtered) - PENDING
+7. ⏳ **Query 5B:** Fetch specific SKUs - INDIVIDUAL (filtered) - PENDING
+
+---
+
+### Catalog Parameter Usage Reference
+
+| Parameter | Where Used | Purpose |
+|-----------|------------|---------|
+| **CUSTCATEGORY** | PRICE table lookup | Gets base markup: `price_cust_cat = CUSTCATEGORY` |
+| **CUSTPRICETIER** | Column selection | Selects which markup column: `PRICE_MARKUP{tier}` |
+| **CUSTPRICEMARKUP** | Adjustment | Added to base markup: `markup + (CUSTPRICEMARKUP × 100)` |
+| **CUSTGROUPCODE** | GP special prices | Lookup: `SPECPR_TYPE='GP' AND SPECPR_KEY = CUSTGROUPCODE` |
+| **CUSTID** | CI special prices | Lookup: `SPECPR_TYPE='CI' AND SPECPR_KEY = CUSTID` |
+| **PROD_CATEGORY** | Product filter | Filters products and PRICE lookup: `PRICE_PROD_CAT = PROD_CATEGORY` |
+| **IS_MEMBER_NULL** | QuickBuy mode | If 1 → skip special pricing (not used in update flow) |
+
+**Pricing Priority Flow:**
+1. Check CI price (uses CUSTID) → If found, RETURN
+2. Check GP price (uses CUSTGROUPCODE) → If found, RETURN
+3. Calculate standard markup:
+   - Get base from PRICE table (uses CUSTCATEGORY + PROD_CATEGORY)
+   - Select column using CUSTPRICETIER
+   - Add CUSTPRICEMARKUP adjustment
+   - Apply WP2 ceiling, MAP floor, max price constraints
+
+---
+
 ## Critical Outstanding Questions
 
 1. **Can you update individual product prices in Shopify price lists without recreating the entire list?**
