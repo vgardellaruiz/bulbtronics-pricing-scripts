@@ -6,7 +6,8 @@
 - **Source:** Legacy ERP with SQL Server database + C# pricing functions
 - **Integration:** Celigo (Standard/Lite plan)
 - **Target:** Shopify B2B with catalogs and price lists
-- **Scale:** ~1,100 catalogs (currently assigned), ~13,000 possible combinations
+- **Scale:** ~1,150 catalogs (~200-300 Individual + ~800-900 Shared), 62 product categories, ~35,000 products
+- **Catalog sections:** ~71,000 total (1,150 catalogs × 62 categories) — typical run affects ~21,394
 - **Shopify Limits:** 10,000 catalogs max, 25 per company location
 
 ---
@@ -21,7 +22,9 @@
 
 #### 2. `dbo.Prod` - Product Catalog
 - **Fields:** PROD_SKU, CATEGORY, REF_COST, PROD_MAX_SELLPRICE, PROD_MAP_SELLPRICE, PROD_MIN_SALE_UNIT, PROD_LOCATION, PROD_STATUS
-- **Tracking:** `___TimeStampUpdated` - tracks any field modification
+- **Date Fields:** `REF_COST_EXPIRE_CYMD` - when REF_COST expires; `REF_COST_START_CYMD` - when REF_COST becomes active
+- **Tracking:** `___TimeStampUpdated` - tracks any field modification (⚠️ fires for ALL changes, not just pricing)
+- **⚠️ Important:** REF_COST expiration/start dates do NOT update the timestamp — must be checked separately
 
 #### 3. `dbo.specpr` - Special Pricing
 - **SPECPR_TYPE:**
@@ -653,130 +656,97 @@ WHERE TableName = 'SPECPR'
 
 ---
 
-## Proposed Update Flow Architecture
+## Current Flow Architecture (Production)
 
-### Flow 1: New Catalog Creation
-- **When:** Weekly or when new customers added
-- **What:** Creates new catalogs that don't exist
-- **How:** Run catalog configuration query
-- **Check:** Query Shopify by catalog title to see if exists
-- **Process:** Full catalog with all products and calculated prices
+### Customer Sync Flow (Event-Driven)
+- **Trigger:** Customer record changes (any field) OR CI special price changes (4 sources)
+- **What it does:**
+  1. Detects customer or CI pricing changes
+  2. Determines if customer needs Individual or Shared catalog
+  3. Creates empty catalog + price list in Shopify if it doesn't exist yet
+  4. Assigns catalog to customer/company location
+  5. Handles transitions (Individual → Shared when CI pricing expires, and vice versa)
+- **Why it includes catalog creation:** Ensures catalog exists before Flow 2 tries to populate it
+- **CI change detection uses 4 sources:**
+  - New/Modified (timestamp on `specpr`)
+  - Expiring (date range: SPECPR_EXPIRE_DATE in window)
+  - Starting (date range: SPECPR_START_DATE in window)
+  - Deleted (DeletedRowsKey audit table)
 
-### Flow 2: PRICE Formula Updates (Optimized)
-**Trigger:** PRICE table `___TimeStampUpdated > @LastRunDate`
-
-**Detection Query:**
+**Catalog Type Determination Query:**
 ```sql
-SELECT DISTINCT pr.PRICE_PROD_CAT, pr.price_cust_cat
-FROM price pr
-WHERE pr.___TimeStampUpdated > @LastRunDate
+DECLARE @CustomerID VARCHAR(50) = {{record.CUSTID}};
+SELECT
+    CASE
+        WHEN EXISTS (
+            SELECT 1 FROM dbo.specpr sp
+            WHERE sp.SPECPR_TYPE = 'CI'
+                AND sp.SPECPR_KEY = @CustomerID
+                AND sp.SPECPR_APPROVER IS NOT NULL
+                AND LTRIM(RTRIM(sp.SPECPR_APPROVER)) <> ''
+                AND sp.SPECPR_EXPIRE_DATE > GETDATE()
+        ) THEN 'INDIVIDUAL'
+        ELSE 'SHARED'
+    END AS CatalogType
 ```
 
-**Find Affected Catalogs:**
-```sql
--- Individual catalogs
-SELECT DISTINCT 'INDIVIDUAL' as CatalogType, c.CUSTID as UniqueKey,
-    c.CUSTCATEGORY, c.CUSTPRICETIER, c.CUSTPRICEMARKUP, c.CUSTGROUPCODE,
-    'DEUT' as PROD_CATEGORY  -- The changed product category
-FROM cust c
-WHERE c.CUSTCATEGORY = 'JD1'  -- Matches changed price_cust_cat
-  AND c.CUSTMEMBERNUM IS NOT NULL
-  AND EXISTS (SELECT 1 FROM specpr sp
-              WHERE sp.SPECPR_TYPE = 'CI'
-                AND sp.SPECPR_KEY = c.CUSTID
-                AND sp.SPECPR_EXPIRE_DATE > GETDATE())
+---
 
-UNION
+### Flow 2: Populate New Catalogs (Scheduled)
+- **Trigger:** Detects catalogs created since last run (via timestamp filters)
+- **What it does:** Populates newly created empty catalogs with ALL products across all 62 categories
+- **Strategy:** Processes one product category at a time to avoid Celigo timeout limits
+- **Why separate from Customer Sync Flow:** Customer Sync creates the empty catalog; Flow 2 fills it with prices
+- **Detection:** Checks for Individual catalogs with new/active CI pricing AND Shared catalogs with recently changed customer configs
 
--- Shared catalogs
-SELECT DISTINCT 'SHARED' as CatalogType,
-    CONCAT(CUSTCATEGORY,'|',CUSTPRICETIER,'|',CUSTPRICEMARKUP,'|',CUSTGROUPCODE,'|0') as UniqueKey,
-    CUSTCATEGORY, CUSTPRICETIER, CUSTPRICEMARKUP, CUSTGROUPCODE,
-    'DEUT' as PROD_CATEGORY
-FROM (SELECT DISTINCT CUSTCATEGORY, CUSTPRICETIER, CUSTPRICEMARKUP, CUSTGROUPCODE
-      FROM cust
-      WHERE CUSTCATEGORY = 'JD1' AND CUSTMEMBERNUM IS NOT NULL) configs
-```
+---
 
-**Action:** Update ONLY products WHERE CATEGORY = changed PROD_CAT in affected catalogs
+### Flow 3: Update Existing Catalog Prices (Scheduled)
+- **Trigger:** Runs every 2–4 hours
+- **What it does:** Detects price-relevant changes and updates only affected catalog sections
+- **Strategy:** Combined delta detection returns only affected sections (1,000–5,000 instead of 71,000)
+- **Branching:** By CatalogType (Individual/Shared) + UpdateScope (CATEGORY/SKU)
+- **Scale (observed):** ~21,394 catalog sections, ~3,000,000 individual SKU calls (mostly unnecessary — see Known Issue below)
 
-**Impact:** ~100 catalogs × ~200 products instead of all
-
-### Flow 3: Daily Product/Special Price Updates
-
-**Strategy: Batch by Product Category**
-
-#### For Product Changes:
-1. Get changed products
-2. Group by CATEGORY
-3. For each affected category → Update that category in ALL catalogs
-
-```sql
--- Get changed products grouped by category
-SELECT DISTINCT CATEGORY
-FROM Prod
-WHERE ___TimeStampUpdated > @LastRunDate
-```
-
-#### For CI (Customer Individual) Special Prices:
-```sql
--- Get affected customer + product category
-SELECT DISTINCT sp.SPECPR_KEY as CUSTID, p.CATEGORY
-FROM [special price change sources] sp
-INNER JOIN Prod p ON sp.SPECPR_SKU = p.PROD_SKU
-WHERE sp.SPECPR_TYPE = 'CI'
-```
-**Action:** Update that product category in ONLY that customer's individual catalog
-
-#### For GP (Group Pricing) Special Prices:
-```sql
--- Get affected group + product category
-SELECT DISTINCT sp.SPECPR_KEY as CUSTGROUPCODE, p.CATEGORY
-FROM [special price change sources] sp
-INNER JOIN Prod p ON sp.SPECPR_SKU = p.PROD_SKU
-WHERE sp.SPECPR_TYPE = 'GP'
-```
-**Action:** Update that product category in ALL catalogs with that buying group
-
-**Combined Change Sources for Special Prices:**
-- New/Modified (timestamp)
-- Expiring (date range)
-- Starting (date range)
-- Deleted (DeletedRowsKey)
+#### Known Issue: Unnecessary Updates
+- `___TimeStampUpdated` on `Prod` fires for ANY field change (inventory, descriptions, etc.), not just pricing fields
+- This causes ~3,000,000 individual product update calls per run, most of which result in no actual price change
+- **Team is building** a dedicated price-change field — not ready yet
+- **Temporary fix planned:** Price Comparison Flow (see `PRICE_COMPARISON_CONTEXT.md`)
 
 ---
 
 ## Celigo Flow Architecture
 
-### Flow 1: New Catalog Creation
-- **Frequency:** Weekly or on-demand
-- **Purpose:** Create new catalogs that don't exist yet in Shopify
-- **Trigger:** Manual or scheduled
-- **Process:**
-  1. Run catalog configuration query (same as Flow 2 Query 1)
-  2. Check if catalog exists in Shopify by catalog title
-  3. If doesn't exist → Create empty catalog + price list
-  4. Populate with all products (35,000 products)
-  5. Calculate prices using JavaScript functions
-  6. Upload to Shopify via `priceListFixedPricesAdd` (batched 250 per call)
-  7. Set quantity rules via `quantityRulesAdd`
-
-**Notes:**
-- Currently functional in Celigo
-- Takes ~11 minutes per catalog
-- Creates complete, ready-to-use catalogs
-- Customer configuration changes (CUSTCATEGORY, TIER, MARKUP, GROUP) are handled by separate customer/company sync flow
+### Customer Sync Flow (Event-Driven)
+- **Trigger:** Customer record changes OR CI special price changes
+- **Purpose:** Keep catalog assignments and catalog types in sync with ERP
+- **Handles catalog creation:** Creates empty catalog + price list if needed, assigns to customer
+- **See:** "Customer Sync Flow" section above for full details
 
 ---
 
-### Flow 2: Update Product Prices (Incremental Updates)
+### Flow 2: Populate New Catalogs (Scheduled)
+- **Frequency:** Scheduled (after Customer Sync Flow creates empty catalogs)
+- **Purpose:** Fill newly created empty catalogs with all products and calculated prices
+- **Process:** One product category at a time (62 categories) to avoid timeouts
+- **Notes:**
+  - Takes ~11 minutes per catalog
+  - Creates complete, ready-to-use catalogs
+  - Uses JavaScript pricing functions to calculate prices
+  - Uploads via `priceListFixedPricesAdd` (batched 250 per call)
+  - Sets quantity rules via `quantityRulesAdd`
 
-**⚠️ DIFFERENT FROM Flow 1 - This updates existing catalogs only**
+---
+
+### Flow 3: Update Product Prices (Incremental Updates)
+
+**⚠️ Updates existing catalogs only — does NOT create new catalogs**
 
 #### **Overview**
 - **Frequency:** Every 2-4 hours (scheduled)
 - **Purpose:** Update existing catalog prices when products/special prices/markup formulas change
-- **Strategy:** Detect changes, determine minimal scope, update only what's needed
+- **Strategy:** Combined delta detection returns only affected catalog sections (1,000–5,000 rows instead of 71,000)
 - **Performance:** ~50x faster than full regeneration by updating only changed SKUs
 
 #### **Shopify API Capabilities (Confirmed)**
@@ -794,80 +764,66 @@ WHERE sp.SPECPR_TYPE = 'GP'
 
 ---
 
-### Flow 2 Detailed Structure
+### Flow 3 Detailed Structure
 
-#### **Step 1: Get All Catalog Sections**
+#### **Step 1: Combined Delta Detection (Single Query)**
 
-**Query 1: Catalog Configuration Query (Divided by Product Category)**
+The delta detection is now a **single combined query** that replaces the old two-step approach (separate catalog listing + per-section change check). It returns only catalog sections that actually need updating, with flags explaining why.
 
-Same query as new catalog creation, returns catalog configurations cross-joined with product categories for efficient batching.
-
-**Output:** ~71,000 rows (1,150 catalogs × 62 categories)
+**Output:** ~1,000–5,000 rows (vs. 71,000 with old approach)
 
 **Example record:**
 ```json
 {
-  "CatalogType": "SHARED",
-  "UniqueKey": "A2|0|0|...|0",
-  "CUSTID": null,
-  "CUSTCATEGORY": "A2",
+  "CatalogType": "INDIVIDUAL",
+  "UniqueKey": "01865",
+  "CUSTID": "01865",
+  "CUSTCATEGORY": "RD1",
   "CUSTPRICETIER": "0",
   "CUSTPRICEMARKUP": 0,
   "CUSTGROUPCODE": "...",
   "IS_MEMBER_NULL": 0,
-  "PROD_CATEGORY": "ADAP"
-}
-```
-
-**Key fields:**
-- `CatalogType`: INDIVIDUAL or SHARED
-- `UniqueKey`: Catalog identifier
-- `CUSTID`: Customer ID (for Individual), NULL (for Shared)
-- `CUSTCATEGORY`: Customer category (e.g., "A2", "JD1", "WP2")
-- `CUSTPRICETIER`: Tier 0-10 (selects which markup column to use)
-- `CUSTPRICEMARKUP`: Customer-specific markup adjustment
-- `CUSTGROUPCODE`: Buying group code
-- `PROD_CATEGORY`: Product category for this processing chunk
-
----
-
-#### **Step 2: Check Changes Since Last Run**
-
-**Query 2: Change Detection Query**
-
-For each catalog section from Query 1, check if any changes affect it.
-
-**Input parameters:**
-- `@LastRunDate` - From Celigo timestamp tracking
-- `@CatalogType` - From catalog section
-- `@CUSTID` - From catalog section
-- `@CUSTCATEGORY` - From catalog section
-- `@CUSTGROUPCODE` - From catalog section
-- `@PROD_CATEGORY` - From catalog section
-
-**Output:**
-```json
-{
+  "PROD_CATEGORY": "ADAP",
   "PriceFormulaChanged": 0,
   "ProductsChanged": 1,
   "CI_Changed": 0,
   "GP_Changed": 0,
   "NeedsUpdate": 1,
-  "UpdateScope": "SKU"
+  "UpdateScope": "SKU",
+  "catalogTitle": "CUST-01865",
+  "catalogId": "gid://shopify/CompanyLocationCatalog/...",
+  "priceListId": "gid://shopify/PriceList/..."
 }
 ```
 
-**Field meanings:**
-- `PriceFormulaChanged`: PRICE table markup formula changed (affects entire category)
-- `ProductsChanged`: Product fields changed (REF_COST, MAX, MAP, CATEGORY)
+**Flag meanings:**
+- `PriceFormulaChanged`: PRICE table markup formula changed → triggers full category update
+- `ProductsChanged`: Product fields changed (REF_COST, MAX, MAP, REF_COST dates)
 - `CI_Changed`: Customer Individual special prices changed
 - `GP_Changed`: Group special prices changed
-- `NeedsUpdate`: 1 = process this section, 0 = skip
-- `UpdateScope`: 'CATEGORY' = update all products, 'SKU' = update only changed SKUs
+- `NeedsUpdate`: 1 = process this section (all returned rows have NeedsUpdate = 1)
+- `UpdateScope`: `'CATEGORY'` = update all products in category; `'SKU'` = only changed SKUs
 
 **Update Scope Logic:**
-- If `PriceFormulaChanged = 1` → `UpdateScope = 'CATEGORY'` (PRICE change affects all products)
-- Otherwise → `UpdateScope = 'SKU'` (only specific SKUs changed)
+- `PriceFormulaChanged = 1` → `UpdateScope = 'CATEGORY'`
+- Otherwise → `UpdateScope = 'SKU'`
+
+**⚠️ Product change detection uses THREE sources (not just timestamp):**
+```sql
+ChangedProducts AS (
+    SELECT DISTINCT LTRIM(RTRIM(CATEGORY)) AS PROD_CATEGORY
+    FROM dbo.Prod WITH (NOLOCK)
+    WHERE (
+        REF_COST_EXPIRE_CYMD BETWEEN @LastRunDate AND GETDATE()
+        OR REF_COST_START_CYMD BETWEEN @LastRunDate AND GETDATE()
+        OR ___TimeStampUpdated > @LastRunDate
+    )
+    AND (PROD_STATUS = 'N' OR (PROD_STATUS = 'D' AND RECD - USED > 0))
+    AND CATEGORY <> 'NONE'
+    AND PROD_SKU_CLASS = 'N'
+)
+```
+Reason: REF_COST expiration/activation do NOT update `___TimeStampUpdated`, so date ranges must be checked separately.
 
 ---
 
@@ -920,97 +876,86 @@ WHERE PRICE_PROD_CAT = @PROD_CATEGORY AND price_cust_cat = @CUSTCATEGORY
 
 ---
 
-#### **Step 3: Branching Logic**
+#### **Step 2: Branching Logic**
 
-**Branch Point 1: NeedsUpdate?**
+**Branch Point 1: CatalogType**
 ```
-if NeedsUpdate = 0 → SKIP (go to next catalog section)
-if NeedsUpdate = 1 → Proceed to Branch Point 2
+INDIVIDUAL → Use Individual catalog queries (CI + GP + Standard)
+SHARED     → Use Shared catalog queries (GP + Standard, NO CI)
 ```
 
-**Branch Point 2: UpdateScope?**
+**Branch Point 2: UpdateScope**
 ```
-if UpdateScope = 'CATEGORY' → PATH A (Full Category Update)
-if UpdateScope = 'SKU' → PATH B (Specific SKUs Only)
+CATEGORY → PATH A (Full Category Update — PriceFormulaChanged = 1)
+SKU      → PATH B (Specific SKUs Only — all other changes)
 ```
 
 ---
 
-#### **Step 4A: PATH A - Full Category Update**
+#### **Step 3A: PATH A - Full Category Update**
 
-**When triggered:**
-- `PriceFormulaChanged = 1` (PRICE table markup changed)
-- Any mix that includes PRICE change
+**When triggered:** `PriceFormulaChanged = 1` (PRICE table markup changed)
 
-**Why full category:**
-- Markup formula affects ALL products in category
-- Cannot optimize to specific SKUs
+**Why full category:** Markup formula affects ALL products in category — cannot optimize to specific SKUs.
 
 **Process:**
-1. Use existing product query (Individual or Shared based on CatalogType)
-2. Fetch ALL products in `@PROD_CATEGORY` (~500-1,000 products)
+1. Branch by CatalogType (Individual/Shared)
+2. Fetch ALL products in `@PROD_CATEGORY` using the full product data query
 3. Calculate prices for all using JavaScript functions
 4. Update Shopify via `priceListFixedPricesAdd` (batched 250 per call)
 
-**Example result:**
-```json
-{
-  "PriceFormulaChanged": 1,
-  "ProductsChanged": 0,
-  "NeedsUpdate": 1,
-  "UpdateScope": "CATEGORY"
-}
-```
+---
+
+#### **Step 3B: PATH B - Specific SKUs Only (2-Query Pattern)**
+
+**When triggered:** Any SKU-level change without PRICE formula change (most common path)
+
+**Why 2 queries:** The original combined query (get changed SKUs + full product data in one query) caused Celigo timeout errors (15-second limit). Split into:
+
+**Query B1 — Get Changed SKU List (lightweight):**
+- Inputs: `{{record.CUSTID}}` (Individual) or `{{record.CUSTGROUPCODE}}` (Shared), `{{record.PROD_CATEGORY}}`, `@LastRunDate`
+- Sources: Product timestamp/date changes + CI changes (4 sources) + GP changes (4 sources)
+- Output: List of distinct `PROD_SKU` values
+- All tables use `WITH (NOLOCK)`
+
+**Celigo One-to-Many Step:**
+- Expands each SKU into its own record
+- Next query receives: `record.PROD_SKU` (the single SKU) + `record._PARENT.*` (all catalog config fields)
+
+**Query B2 — Fetch Single Product Data (one SKU at a time):**
+- Input: `{{record.PROD_SKU}}` for the target SKU
+- Catalog config from: `{{record._PARENT.CUSTCATEGORY}}`, `{{record._PARENT.CUSTGROUPCODE}}`, etc.
+- Fetches full pricing data (product fields, price table, special prices) for that ONE SKU
+- Individual version: includes CI + GP special price joins
+- Shared version: NO CI join, returns `NULL AS CI_SPECIAL_PRICE`
+- All joins use `WITH (NOLOCK)`
+
+**Step 4: Calculate Price**
+- JavaScript transform using `calculatePriceIndividual()` or `calculatePriceShared()`
+
+**Step 5: Batch & Update Shopify**
+- Post response map hook groups records into batches of 250
+- `priceListFixedPricesAdd` mutation
+
+**Performance:**
+- Before (category-level): 1,150 catalogs × 500 DEUT products = 575,000 price updates
+- After (SKU-level): 1,150 catalogs × ~10 changed SKUs = ~11,500 price updates
+- ~50x faster per legitimate pricing change
 
 ---
 
-#### **Step 4B: PATH B - Specific SKUs Only** ⚡
-
-**When triggered:**
-- `ProductsChanged = 1` AND `PriceFormulaChanged = 0`
-- `CI_Changed = 1` AND `PriceFormulaChanged = 0`
-- `GP_Changed = 1` AND `PriceFormulaChanged = 0`
-- Any SKU-level change without PRICE formula change
-
-**Why specific SKUs:**
-- Only specific products changed
-- Can optimize by fetching/updating only those (5-50 SKUs vs 500-1,000)
-
-**Process:**
-1. **Query 3:** Get list of changed SKUs for this catalog section
-2. Use modified product query (filtered by SKU list)
-3. Fetch ONLY those SKUs' product data
-4. Calculate prices for only those SKUs
-5. Update Shopify via `priceListFixedPricesAdd` (batched 250 per call)
-
-**Performance improvement:**
-- Before: Update 1,150 catalogs × 500 DEUT products = 575,000 price updates
-- After: Update 1,150 catalogs × 10 changed SKUs = 11,500 price updates
-- **~50x faster!** 🚀
-
-**Example result:**
-```json
-{
-  "PriceFormulaChanged": 0,
-  "ProductsChanged": 1,
-  "NeedsUpdate": 1,
-  "UpdateScope": "SKU"
-}
-```
-
----
-
-### Flow 2 Query Summary
+### Flow 3 Query Summary
 
 **Queries Used:**
 
-1. ✅ **Query 1:** Get all catalog sections (divided by product category) - EXISTS
-2. ✅ **Query 2:** Check changes for specific catalog section - CREATED
-3. ⏳ **Query 3:** Get changed SKUs list (for PATH B) - PENDING
-4. ✅ **Query 4A:** Fetch all products - SHARED (full category) - EXISTS
-5. ✅ **Query 4B:** Fetch all products - INDIVIDUAL (full category) - EXISTS
-6. ⏳ **Query 5A:** Fetch specific SKUs - SHARED (filtered) - PENDING
-7. ⏳ **Query 5B:** Fetch specific SKUs - INDIVIDUAL (filtered) - PENDING
+1. ✅ **Step 1:** Combined delta detection query — returns affected catalog sections with flags
+2. ✅ **Step 3A — PATH A (CATEGORY):** Full product data query — Individual and Shared variants
+3. ✅ **Step 3B — PATH B (SKU), Query B1:** Get changed SKU list — Individual and Shared variants (lightweight)
+4. ✅ **Step 3B — PATH B (SKU), Query B2:** Fetch single product data — Individual and Shared variants (one SKU at a time via `record._PARENT.*`)
+
+**⚠️ Important: All queries use `WITH (NOLOCK)`**
+- Prevents deadlocks from Celigo parallel processing (confirmed deadlock errors without it)
+- Celigo concurrency should be limited to 5–10 parallel operations to reduce DB/API load
 
 ---
 
@@ -1037,21 +982,31 @@ if UpdateScope = 'SKU' → PATH B (Specific SKUs Only)
 
 ---
 
-## Critical Outstanding Questions
+## Resolved Questions
 
-1. **Can you update individual product prices in Shopify price lists without recreating the entire list?**
-   - If YES → Can do surgical SKU-level updates (much faster)
-   - If NO → Must batch by product category as proposed
+1. ✅ **Can you update individual product prices without recreating the entire price list?**
+   - YES — `priceListFixedPricesAdd` mutation updates/overwrites prices by variant ID without recreating the list
+   - Batching: 250 prices per call
+   - This enables the SKU-level update pattern
 
-2. **Current Shopify API usage:**
-   - Are you using `priceListFixedPricesAdd` mutation?
-   - Do you delete and recreate price lists or update existing?
-   - Maximum 250 prices per mutation call
+2. ✅ **Shopify API usage confirmed:**
+   - Uses `priceListFixedPricesAdd` mutation
+   - Prices are overwritten (not deleted + recreated)
+   - `quantityRulesAdd` for quantity rules
 
-3. **What causes the 11-minute catalog creation time?**
-   - SQL query to fetch products?
-   - JavaScript price calculation?
-   - Shopify API upload (most likely)?
+3. **11-minute catalog creation time:** Most likely Shopify API upload time (batching 35,000 products at 250 per call = 140 API calls per catalog)
+
+## Outstanding Questions / Known Gaps
+
+1. **New price-specific change field in `Prod` table:**
+   - Team is building this field to replace `___TimeStampUpdated` for pricing detection
+   - Not ready yet — when available, it will eliminate most of the ~3,000,000 unnecessary calls
+   - Price Comparison Flow is the interim solution
+
+2. **Price Comparison Flow design:**
+   - How to store comparison results (temporary DB table, Celigo storage, file?)
+   - How to handle price precision (rounding threshold for float comparison)
+   - See `PRICE_COMPARISON_CONTEXT.md` for full context
 
 ---
 
@@ -1065,6 +1020,9 @@ if UpdateScope = 'SKU' → PATH B (Specific SKUs Only)
 - ✅ All catalogs contain all products (just different prices per catalog)
 - ✅ Never create queries or functions unless explicitly requested
 - ✅ Always verify against C# source of truth before implementing
+- ✅ All SQL queries must use `WITH (NOLOCK)` on all table references (prevents deadlocks from parallel Celigo processing)
+- ✅ Celigo concurrency: limit to 5–10 parallel operations to prevent DB/API overload
+- ✅ Celigo handlebars syntax: DECLARE variables must use `{{record.FIELDNAME}}` or `{{record._PARENT.FIELDNAME}}` — never hardcode test values in production queries
 
 ### Shopify B2B Pricing Priority Issue
 **Problem:** Shopify B2B has no catalog priority - it shows the LOWEST price across all assigned catalogs.
@@ -1104,21 +1062,20 @@ if UpdateScope = 'SKU' → PATH B (Specific SKUs Only)
 - `db.js` - Database connection configuration
 - `test.js` - Testing utilities
 - `prices_long.csv` - Generated pricing output
-- `PROJECT_CONTEXT.md` - This file
+- `PROJECT_CONTEXT.md` - This file (overall architecture and flow design)
+- `PRICE_COMPARISON_CONTEXT.md` - Context for the Price Comparison Flow (interim solution for reducing unnecessary updates)
 
 ---
 
 ## Next Steps
 
-1. **Confirm Shopify API capabilities** for individual price updates
-2. **Design complete SQL queries** for update flow:
-   - PRICE change detection → affected catalogs + products
-   - Product change detection → grouping by category
-   - Special price change detection → affected catalogs mapping
-3. **Build Celigo flow structure** for incremental updates
-4. **Test performance** of category-batched updates vs full regeneration
-5. **Implement change tracking** mechanism to store @LastRunDate
-6. **Create update validation** to ensure prices match C# calculation
+1. **Design and build Price Comparison Flow** (see `PRICE_COMPARISON_CONTEXT.md`):
+   - Calculate what each product price SHOULD be (using existing JS functions)
+   - Fetch current price from Shopify price list
+   - Compare and flag only products where price actually changed
+   - Use flagged records to drive Flow 3 instead of all detected changes
+2. **Await new price-specific change field** on `Prod` table from dev team (will replace interim Price Comparison Flow)
+3. **Catalog deletion strategy:** Delete catalogs with 0 company/location assignments (weekly cleanup with optional grace period) to stay within Shopify's 10,000 catalog limit
 
 ---
 
@@ -1129,9 +1086,14 @@ if UpdateScope = 'SKU' → PATH B (Specific SKUs Only)
 2. QuickBuy users should skip special pricing lookup entirely (IHU/106565 are wasteful placeholders)
 3. PRICE formula changes are infrequent (<annually) and not time-sensitive
 4. Hourly to 6-hour sync schedule is acceptable for PRICE changes
+5. **Shopify API confirmed:** `priceListFixedPricesAdd` used, prices overwritten (not deleted + recreated), 250 per batch
+6. **Individual catalog** = ALL products for that category + standard markup + GP special prices + CI special prices (CI highest priority)
+7. **`___TimeStampUpdated`** fires for ANY Prod field change — team is building a dedicated price-change field (not yet ready)
+8. **`PRICE_DEFAULT_LEVEL`** = markup used when `CUSTPRICETIER = 0` (no tier selection)
+9. **`PRICE_SELECTIONS`** = fallback markup when the selected tier's markup value is 0
+10. **Product category changes** are detected via `___TimeStampUpdated` — old category in Shopify is NOT a concern because price lists use variant IDs (not category structure)
 
 ### Questions Pending:
-1. Shopify API update capabilities (individual prices vs full price list replacement)
-2. Current API implementation details (mutations used, deletion strategy)
-3. Root cause of 11-minute catalog creation time
+1. Root cause of 11-minute catalog creation time (likely Shopify API batching)
+2. Price Comparison Flow implementation decisions (storage, precision threshold) — see `PRICE_COMPARISON_CONTEXT.md`
 
