@@ -272,9 +272,9 @@ ProductCategories AS (
         AND PRICAT_CATEGORY <> 'NONE'
 ),
 AllCatalogs AS (
-    SELECT 
+    SELECT
         ic.CatalogType,
-        ic.UniqueKey,
+        CONCAT(ic.UniqueKey, '|', pc.PROD_CATEGORY) AS UniqueKey,
         ic.CUSTID,
         ic.CUSTCATEGORY,
         ic.CUSTPRICETIER,
@@ -285,9 +285,9 @@ AllCatalogs AS (
     FROM IndividualCatalogs ic
     CROSS JOIN ProductCategories pc
     UNION ALL
-    SELECT 
+    SELECT
         sc.CatalogType,
-        sc.UniqueKey,
+        CONCAT(sc.UniqueKey, '|', pc.PROD_CATEGORY) AS UniqueKey,
         sc.CUSTID,
         sc.CUSTCATEGORY,
         sc.CUSTPRICETIER,
