@@ -145,11 +145,32 @@ The Customer Sync Flow uses this lookup to determine catalog assignment and hand
 
 ---
 
+## Catalog Title Format (Shopify)
+
+Rollup shared catalog titles follow this pattern:
+
+```
+C0<rollup_number>-T<tier_number>
+```
+
+**Examples:**
+- `C01-T1` — Rollup group C01, tier 1
+- `C03-T4` — Rollup group C03, tier 4
+- `C05-T8` — Rollup group C05, tier 8
+
+This produces 40 distinct shared catalog titles for C01–C05 (5 groups × 8 tiers).
+
+R01 title format: **TBD** — R01 has a single tier using `PRICE_DEFAULT_LEVEL`; no tier suffix may be needed (e.g., just `R01`).
+
+Individual catalog titles remain unchanged: `CUST-{CUSTID}`
+
+---
+
 ## Open Questions
 
-1. **`CUSTPRICEMARKUP`:** The old shared catalog key included `CUSTPRICEMARKUP` as a separate dimension. In the new rollup key (`CATGOR_CATALOG_ROLLUP|CUSTPRICETIER`), it is not included. Clarification needed: is `CUSTPRICEMARKUP` always 0 for rolled-up customers, deprecated, or still applied as a per-customer adjustment at price calculation time without creating separate catalogs?
+1. **`CUSTPRICEMARKUP`:** In the old system, this per-customer adjustment (`finalMarkup = baseMarkup + CUSTPRICEMARKUP × 100`) was part of the shared catalog unique key because customers with different values would calculate different prices and couldn't share a catalog. In the new rollup key (`CATGOR_CATALOG_ROLLUP|CUSTPRICETIER`) it is absent. Clarification needed: are all rolled-up customers expected to have `CUSTPRICEMARKUP = 0`, or does it still vary and create sub-variants?
 
-2. **Catalog title/naming convention:** What is the exact catalog title format for rollup catalogs in Shopify? (e.g., `ROLLUP-C03-T2`, `C03-T2`, `CATALOG-C03-TIER2`?)
+2. **R01 catalog title:** Is the Shopify title for the R01 catalog just `R01`, or does it follow a different pattern?
 
 3. **`CATGOR` change detection:** Should the `___TimeStampUpdated` on `CATGOR` be monitored for rollup reassignments (e.g., if a category moves from C03 to C04)?
 
