@@ -161,7 +161,7 @@ C0<rollup_number>-T<tier_number>-PM<custpricemarkup>
 - `C03-T4-PM0.5` — Rollup group C03, tier 4, +0.5 markup adjustment
 - `C05-T8-PM0` — Rollup group C05, tier 8, no markup adjustment
 
-R01 title format: **TBD** — R01 has a single tier using `PRICE_DEFAULT_LEVEL`; exact title pattern to be confirmed (e.g., `R01-PM0`).
+R01 title format follows the same suffix pattern: `R01-PM<CUSTPRICEMARKUP>` (e.g., `R01-PM0`).
 
 Individual catalog titles remain unchanged: `CUST-{CUSTID}`
 
@@ -169,9 +169,7 @@ Individual catalog titles remain unchanged: `CUST-{CUSTID}`
 
 ## Open Questions
 
-1. **R01 catalog title:** Does R01 follow the same `PM<value>` suffix pattern (e.g., `R01-PM0`), or does it use a different format?
-
-2. **`CATGOR` change detection:** Should the `___TimeStampUpdated` on `CATGOR` be monitored for rollup reassignments (e.g., if a category moves from C03 to C04)?
+1. **`CATGOR` change detection:** Handled in a separate dedicated flow — not part of Flow 2 or Flow 3. When a category moves to a different rollup group, that flow reassigns affected customers to the correct catalog.
 
 ---
 
