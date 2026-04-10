@@ -783,13 +783,14 @@ The delta detection is now a **single combined query** that replaces the old two
 
 **Output:** ~1,000–5,000 rows (vs. 71,000 with old approach)
 
-**Example record:**
+**Example record (Individual):**
 ```json
 {
   "CatalogType": "INDIVIDUAL",
-  "UniqueKey": "01865",
+  "UniqueKey": "01865|ADAP",
   "CUSTID": "01865",
   "CUSTCATEGORY": "RD1",
+  "CATGOR_CATALOG_ROLLUP": null,
   "CUSTPRICETIER": "0",
   "CUSTPRICEMARKUP": 0,
   "CUSTGROUPCODE": "...",
@@ -800,11 +801,299 @@ The delta detection is now a **single combined query** that replaces the old two
   "CI_Changed": 0,
   "GP_Changed": 0,
   "NeedsUpdate": 1,
-  "UpdateScope": "SKU",
-  "catalogTitle": "CUST-01865",
-  "catalogId": "gid://shopify/CompanyLocationCatalog/...",
-  "priceListId": "gid://shopify/PriceList/..."
+  "UpdateScope": "SKU"
 }
+```
+
+**Example record (Shared/Rollup):**
+```json
+{
+  "CatalogType": "SHARED",
+  "UniqueKey": "C03|2|0|IHU|0|ADAP",
+  "CUSTID": null,
+  "CUSTCATEGORY": null,
+  "CATGOR_CATALOG_ROLLUP": "C03",
+  "CUSTPRICETIER": "2",
+  "CUSTPRICEMARKUP": 0,
+  "CUSTGROUPCODE": "IHU",
+  "IS_MEMBER_NULL": 0,
+  "PROD_CATEGORY": "ADAP",
+  "PriceFormulaChanged": 0,
+  "ProductsChanged": 1,
+  "CI_Changed": 0,
+  "GP_Changed": 0,
+  "NeedsUpdate": 1,
+  "UpdateScope": "SKU"
+}
+```
+
+**Full Query:**
+
+```sql
+{{!--DECLARE @LastRunDate DATETIME = '2026-03-11T00:00:00';--}}
+DECLARE @LastRunDate DATETIME = {{dateAdd lastExportDateTime "-18000000" }};
+
+-- Step 1: Detect all changes globally
+WITH ChangedProducts AS (
+    SELECT DISTINCT
+        LTRIM(RTRIM(CATEGORY)) AS PROD_CATEGORY
+    FROM dbo.Prod WITH (NOLOCK)
+    WHERE PRODMEMO_DATE2 > @LastRunDate
+      AND (PROD_STATUS = 'N' OR (PROD_STATUS = 'D' AND RECD - USED > 0))
+      AND CATEGORY <> 'NONE'
+      AND PROD_SKU_CLASS = 'N'
+),
+ChangedPriceFormulas AS (
+    -- CHANGED: added LEFT JOIN to CATGOR to resolve CATGOR_CATALOG_ROLLUP
+    -- Used in FilteredSections to match Shared catalog sections by rollup code
+    SELECT DISTINCT
+        LTRIM(RTRIM(pr.PRICE_PROD_CAT)) AS PROD_CATEGORY,
+        LTRIM(RTRIM(pr.price_cust_cat)) AS CUSTCATEGORY,
+        LTRIM(RTRIM(cg.CATGOR_CATALOG_ROLLUP)) AS CATGOR_CATALOG_ROLLUP
+    FROM dbo.price pr WITH (NOLOCK)
+    LEFT JOIN dbo.CATGOR cg WITH (NOLOCK)
+        ON LTRIM(RTRIM(cg.CATGOR_OLD_CATEGORY)) = LTRIM(RTRIM(pr.price_cust_cat))
+    WHERE pr.___TimeStampUpdated > @LastRunDate
+),
+ChangedCISpecialPrices AS (
+    SELECT DISTINCT
+        sp.SPECPR_KEY AS CUSTID,
+        LTRIM(RTRIM(p.CATEGORY)) AS PROD_CATEGORY
+    FROM (
+        SELECT SPECPR_KEY, SPECPR_SKU
+        FROM dbo.specpr
+        WHERE SPECPR_TYPE = 'CI'
+          AND ___TimeStampUpdated > @LastRunDate
+          AND SPECPR_EXPIRE_DATE > GETDATE()
+          AND SPECPR_APPROVER IS NOT NULL
+          AND LTRIM(RTRIM(SPECPR_APPROVER)) <> ''
+        UNION
+        SELECT SPECPR_KEY, SPECPR_SKU
+        FROM dbo.specpr
+        WHERE SPECPR_TYPE = 'CI'
+          AND SPECPR_EXPIRE_DATE BETWEEN @LastRunDate AND GETDATE()
+          AND SPECPR_APPROVER IS NOT NULL
+          AND LTRIM(RTRIM(SPECPR_APPROVER)) <> ''
+        UNION
+        SELECT SPECPR_KEY, SPECPR_SKU
+        FROM dbo.specpr
+        WHERE SPECPR_TYPE = 'CI'
+          AND SPECPR_START_DATE BETWEEN @LastRunDate AND GETDATE()
+          AND SPECPR_EXPIRE_DATE > GETDATE()
+          AND SPECPR_APPROVER IS NOT NULL
+          AND LTRIM(RTRIM(SPECPR_APPROVER)) <> ''
+        UNION
+        SELECT Key2, Key3
+        FROM dbo.DeletedRowsKey
+        WHERE TableName = 'SPECPR'
+          AND Key1 = 'CI'
+          AND ___TimeStampUpdated > @LastRunDate
+    ) sp
+    INNER JOIN dbo.Prod p WITH (NOLOCK)
+        ON LTRIM(RTRIM(p.PROD_SKU)) = LTRIM(RTRIM(sp.SPECPR_SKU))
+),
+ChangedGPSpecialPrices AS (
+    SELECT DISTINCT
+        LTRIM(RTRIM(sp.SPECPR_KEY)) AS CUSTGROUPCODE,
+        LTRIM(RTRIM(p.CATEGORY)) AS PROD_CATEGORY
+    FROM (
+        SELECT SPECPR_KEY, SPECPR_SKU
+        FROM dbo.specpr
+        WHERE SPECPR_TYPE = 'GP'
+          AND ___TimeStampUpdated > @LastRunDate
+          AND SPECPR_EXPIRE_DATE > GETDATE()
+          AND SPECPR_APPROVER IS NOT NULL
+          AND LTRIM(RTRIM(SPECPR_APPROVER)) <> ''
+        UNION
+        SELECT SPECPR_KEY, SPECPR_SKU
+        FROM dbo.specpr
+        WHERE SPECPR_TYPE = 'GP'
+          AND SPECPR_EXPIRE_DATE BETWEEN @LastRunDate AND GETDATE()
+          AND SPECPR_APPROVER IS NOT NULL
+          AND LTRIM(RTRIM(SPECPR_APPROVER)) <> ''
+        UNION
+        SELECT SPECPR_KEY, SPECPR_SKU
+        FROM dbo.specpr
+        WHERE SPECPR_TYPE = 'GP'
+          AND SPECPR_START_DATE BETWEEN @LastRunDate AND GETDATE()
+          AND SPECPR_EXPIRE_DATE > GETDATE()
+          AND SPECPR_APPROVER IS NOT NULL
+          AND LTRIM(RTRIM(SPECPR_APPROVER)) <> ''
+        UNION
+        SELECT Key2, Key3
+        FROM dbo.DeletedRowsKey
+        WHERE TableName = 'SPECPR'
+          AND Key1 = 'GP'
+          AND ___TimeStampUpdated > @LastRunDate
+    ) sp
+    INNER JOIN dbo.Prod p WITH (NOLOCK)
+        ON LTRIM(RTRIM(p.PROD_SKU)) = LTRIM(RTRIM(sp.SPECPR_SKU))
+),
+
+-- Step 2: Get all catalog configurations
+CustomersWithIndividualPricing AS (
+    SELECT DISTINCT
+        sp.SPECPR_KEY AS CUSTID
+    FROM dbo.specpr sp
+    WHERE sp.SPECPR_TYPE = 'CI'
+      AND sp.SPECPR_APPROVER IS NOT NULL
+      AND LTRIM(RTRIM(sp.SPECPR_APPROVER)) <> ''
+      AND sp.SPECPR_EXPIRE_DATE > GETDATE()
+),
+IndividualCatalogs AS (
+    SELECT
+        'INDIVIDUAL' AS CatalogType,
+        c.CUSTID AS UniqueKey,
+        c.CUSTID,
+        LTRIM(RTRIM(ISNULL(c.CUSTCATEGORY, ''))) AS CUSTCATEGORY,
+        LTRIM(RTRIM(ISNULL(c.CUSTPRICETIER, '0'))) AS CUSTPRICETIER,
+        ISNULL(c.CUSTPRICEMARKUP, 0) AS CUSTPRICEMARKUP,
+        LTRIM(RTRIM(ISNULL(c.CUSTGROUPCODE, ''))) AS CUSTGROUPCODE,
+        0 AS IS_MEMBER_NULL
+    FROM dbo.cust c
+    INNER JOIN CustomersWithIndividualPricing ci
+        ON c.CUSTID = ci.CUSTID
+    WHERE c.CUSTID IS NOT NULL
+      AND LTRIM(RTRIM(ISNULL(c.CUSTCATEGORY, ''))) <> ''
+      AND c.CUSTMEMBERNUM IS NOT NULL
+),
+SharedCatalogs AS (
+    -- CHANGED: replaced CUSTCATEGORY grouping with CATGOR_CATALOG_ROLLUP via CATGOR join
+    SELECT DISTINCT
+        'SHARED' AS CatalogType,
+        CONCAT(
+            LTRIM(RTRIM(ISNULL(cg.CATGOR_CATALOG_ROLLUP, ''))), '|',
+            LTRIM(RTRIM(ISNULL(c.CUSTPRICETIER, '0'))), '|',
+            CAST(ISNULL(c.CUSTPRICEMARKUP, 0) AS VARCHAR(20)), '|',
+            LTRIM(RTRIM(ISNULL(c.CUSTGROUPCODE, ''))), '|',
+            '0'
+        ) AS UniqueKey,
+        NULL AS CUSTID,
+        LTRIM(RTRIM(ISNULL(cg.CATGOR_CATALOG_ROLLUP, ''))) AS CATGOR_CATALOG_ROLLUP,
+        LTRIM(RTRIM(ISNULL(c.CUSTPRICETIER, '0'))) AS CUSTPRICETIER,
+        ISNULL(c.CUSTPRICEMARKUP, 0) AS CUSTPRICEMARKUP,
+        LTRIM(RTRIM(ISNULL(c.CUSTGROUPCODE, ''))) AS CUSTGROUPCODE,
+        0 AS IS_MEMBER_NULL
+    FROM dbo.cust c
+    INNER JOIN dbo.CATGOR cg WITH (NOLOCK)
+        ON LTRIM(RTRIM(cg.CATGOR_OLD_CATEGORY)) = LTRIM(RTRIM(c.CUSTCATEGORY))
+    LEFT JOIN CustomersWithIndividualPricing ci
+        ON c.CUSTID = ci.CUSTID
+    WHERE c.CUSTID IS NOT NULL
+      AND ci.CUSTID IS NULL
+      AND LTRIM(RTRIM(ISNULL(c.CUSTCATEGORY, ''))) <> ''
+      AND c.CUSTMEMBERNUM IS NOT NULL
+      AND LTRIM(RTRIM(ISNULL(cg.CATGOR_CATALOG_ROLLUP, ''))) <> ''
+),
+ProductCategories AS (
+    SELECT DISTINCT
+        LTRIM(RTRIM(PRICAT_CATEGORY)) AS PROD_CATEGORY
+    FROM dbo.pricat
+    WHERE PRICAT_CATEGORY IS NOT NULL
+      AND LTRIM(RTRIM(PRICAT_CATEGORY)) <> ''
+      AND PRICAT_CATEGORY <> 'NONE'
+),
+AllCatalogSections AS (
+    -- CHANGED: added CATGOR_CATALOG_ROLLUP column (NULL for Individual)
+    --          CUSTCATEGORY is NULL for Shared (not used in downstream queries)
+    SELECT
+        ic.CatalogType,
+        CONCAT(RTRIM(ic.UniqueKey), '|', pc.PROD_CATEGORY) AS UniqueKey,
+        ic.CUSTID,
+        ic.CUSTCATEGORY,
+        NULL AS CATGOR_CATALOG_ROLLUP,
+        ic.CUSTPRICETIER,
+        ic.CUSTPRICEMARKUP,
+        ic.CUSTGROUPCODE,
+        ic.IS_MEMBER_NULL,
+        pc.PROD_CATEGORY
+    FROM IndividualCatalogs ic
+    CROSS JOIN ProductCategories pc
+
+    UNION ALL
+
+    SELECT
+        sc.CatalogType,
+        CONCAT(RTRIM(sc.UniqueKey), '|', pc.PROD_CATEGORY) AS UniqueKey,
+        sc.CUSTID,
+        NULL AS CUSTCATEGORY,
+        sc.CATGOR_CATALOG_ROLLUP,
+        sc.CUSTPRICETIER,
+        sc.CUSTPRICEMARKUP,
+        sc.CUSTGROUPCODE,
+        sc.IS_MEMBER_NULL,
+        pc.PROD_CATEGORY
+    FROM SharedCatalogs sc
+    CROSS JOIN ProductCategories pc
+),
+
+-- Step 3: Filter to only sections that need updating
+FilteredSections AS (
+    SELECT
+        acs.*,
+        CASE WHEN pf.PROD_CATEGORY IS NOT NULL THEN 1 ELSE 0 END AS PriceFormulaChanged,
+        CASE WHEN cp.PROD_CATEGORY IS NOT NULL THEN 1 ELSE 0 END AS ProductsChanged,
+        CASE WHEN ci.CUSTID IS NOT NULL THEN 1 ELSE 0 END AS CI_Changed,
+        CASE WHEN gp.CUSTGROUPCODE IS NOT NULL THEN 1 ELSE 0 END AS GP_Changed
+    FROM AllCatalogSections acs
+
+    -- CHANGED: price formula join now splits by CatalogType
+    -- Individual: match directly on CUSTCATEGORY (unchanged logic)
+    -- Shared: match on CATGOR_CATALOG_ROLLUP (rollup-aware)
+    LEFT JOIN ChangedPriceFormulas pf
+        ON pf.PROD_CATEGORY = acs.PROD_CATEGORY
+       AND (
+               (acs.CatalogType = 'INDIVIDUAL' AND pf.CUSTCATEGORY = acs.CUSTCATEGORY)
+            OR (acs.CatalogType = 'SHARED'     AND pf.CATGOR_CATALOG_ROLLUP = acs.CATGOR_CATALOG_ROLLUP)
+           )
+
+    -- Unchanged
+    LEFT JOIN ChangedProducts cp
+        ON cp.PROD_CATEGORY = acs.PROD_CATEGORY
+
+    -- Unchanged
+    LEFT JOIN ChangedCISpecialPrices ci
+        ON ci.CUSTID = acs.CUSTID
+       AND ci.PROD_CATEGORY = acs.PROD_CATEGORY
+       AND acs.CatalogType = 'INDIVIDUAL'
+
+    -- Unchanged
+    LEFT JOIN ChangedGPSpecialPrices gp
+        ON LTRIM(RTRIM(gp.CUSTGROUPCODE)) = LTRIM(RTRIM(acs.CUSTGROUPCODE))
+       AND gp.PROD_CATEGORY = acs.PROD_CATEGORY
+       AND acs.CUSTGROUPCODE IS NOT NULL
+       AND LTRIM(RTRIM(acs.CUSTGROUPCODE)) <> ''
+
+    WHERE pf.PROD_CATEGORY IS NOT NULL
+       OR cp.PROD_CATEGORY IS NOT NULL
+       OR ci.CUSTID IS NOT NULL
+       OR gp.CUSTGROUPCODE IS NOT NULL
+)
+
+-- Step 4: Return final result with UpdateScope
+-- CHANGED: added CATGOR_CATALOG_ROLLUP to SELECT
+SELECT
+    CatalogType,
+    UniqueKey,
+    RTRIM(LTRIM(CUSTID)) AS CUSTID,
+    CUSTCATEGORY,
+    CATGOR_CATALOG_ROLLUP,
+    CUSTPRICETIER,
+    CUSTPRICEMARKUP,
+    CUSTGROUPCODE,
+    IS_MEMBER_NULL,
+    PROD_CATEGORY,
+    PriceFormulaChanged,
+    ProductsChanged,
+    CI_Changed,
+    GP_Changed,
+    1 AS NeedsUpdate,
+    CASE
+        WHEN PriceFormulaChanged = 1 THEN 'CATEGORY'
+        ELSE 'SKU'
+    END AS UpdateScope
+FROM FilteredSections
+ORDER BY CatalogType DESC, UniqueKey, PROD_CATEGORY;
 ```
 
 **Flag meanings:**
