@@ -843,17 +843,27 @@ WITH ChangedProducts AS (
       AND CATEGORY <> 'NONE'
       AND PROD_SKU_CLASS = 'N'
 ),
-ChangedPriceFormulas AS (
-    -- CHANGED: added LEFT JOIN to CATGOR to resolve CATGOR_CATALOG_ROLLUP
-    -- Used in FilteredSections to match Shared catalog sections by rollup code
+ChangedPriceFormulasIndividual AS (
+    -- For Individual catalogs: match on CUSTCATEGORY directly
+    -- DISTINCT on (PROD_CATEGORY, CUSTCATEGORY) — one row per pair, no duplication risk
+    SELECT DISTINCT
+        LTRIM(RTRIM(PRICE_PROD_CAT)) AS PROD_CATEGORY,
+        LTRIM(RTRIM(price_cust_cat)) AS CUSTCATEGORY
+    FROM dbo.price WITH (NOLOCK)
+    WHERE ___TimeStampUpdated > @LastRunDate
+),
+ChangedPriceFormulasShared AS (
+    -- For Shared catalogs: match on CATGOR_CATALOG_ROLLUP
+    -- DISTINCT on (PROD_CATEGORY, CATGOR_CATALOG_ROLLUP) ensures each rollup catalog
+    -- is only represented once even if multiple of its member categories changed
     SELECT DISTINCT
         LTRIM(RTRIM(pr.PRICE_PROD_CAT)) AS PROD_CATEGORY,
-        LTRIM(RTRIM(pr.price_cust_cat)) AS CUSTCATEGORY,
         LTRIM(RTRIM(cg.CATGOR_CATALOG_ROLLUP)) AS CATGOR_CATALOG_ROLLUP
     FROM dbo.price pr WITH (NOLOCK)
-    LEFT JOIN dbo.CATGOR cg WITH (NOLOCK)
+    INNER JOIN dbo.CATGOR cg WITH (NOLOCK)
         ON LTRIM(RTRIM(cg.CATGOR_OLD_CATEGORY)) = LTRIM(RTRIM(pr.price_cust_cat))
     WHERE pr.___TimeStampUpdated > @LastRunDate
+      AND LTRIM(RTRIM(cg.CATGOR_CATALOG_ROLLUP)) <> ''
 ),
 ChangedCISpecialPrices AS (
     SELECT DISTINCT
@@ -1031,21 +1041,24 @@ AllCatalogSections AS (
 FilteredSections AS (
     SELECT
         acs.*,
-        CASE WHEN pf.PROD_CATEGORY IS NOT NULL THEN 1 ELSE 0 END AS PriceFormulaChanged,
+        CASE WHEN pfi.PROD_CATEGORY IS NOT NULL
+              OR pfs.PROD_CATEGORY IS NOT NULL THEN 1 ELSE 0 END AS PriceFormulaChanged,
         CASE WHEN cp.PROD_CATEGORY IS NOT NULL THEN 1 ELSE 0 END AS ProductsChanged,
         CASE WHEN ci.CUSTID IS NOT NULL THEN 1 ELSE 0 END AS CI_Changed,
         CASE WHEN gp.CUSTGROUPCODE IS NOT NULL THEN 1 ELSE 0 END AS GP_Changed
     FROM AllCatalogSections acs
 
-    -- CHANGED: price formula join now splits by CatalogType
-    -- Individual: match directly on CUSTCATEGORY (unchanged logic)
-    -- Shared: match on CATGOR_CATALOG_ROLLUP (rollup-aware)
-    LEFT JOIN ChangedPriceFormulas pf
-        ON pf.PROD_CATEGORY = acs.PROD_CATEGORY
-       AND (
-               (acs.CatalogType = 'INDIVIDUAL' AND pf.CUSTCATEGORY = acs.CUSTCATEGORY)
-            OR (acs.CatalogType = 'SHARED'     AND pf.CATGOR_CATALOG_ROLLUP = acs.CATGOR_CATALOG_ROLLUP)
-           )
+    -- CHANGED: two separate joins, one per catalog type
+    -- Each CTE already has DISTINCT on its own key, so no catalog is matched more than once
+    LEFT JOIN ChangedPriceFormulasIndividual pfi
+        ON pfi.PROD_CATEGORY = acs.PROD_CATEGORY
+       AND acs.CatalogType = 'INDIVIDUAL'
+       AND pfi.CUSTCATEGORY = acs.CUSTCATEGORY
+
+    LEFT JOIN ChangedPriceFormulasShared pfs
+        ON pfs.PROD_CATEGORY = acs.PROD_CATEGORY
+       AND acs.CatalogType = 'SHARED'
+       AND pfs.CATGOR_CATALOG_ROLLUP = acs.CATGOR_CATALOG_ROLLUP
 
     -- Unchanged
     LEFT JOIN ChangedProducts cp
@@ -1064,7 +1077,8 @@ FilteredSections AS (
        AND acs.CUSTGROUPCODE IS NOT NULL
        AND LTRIM(RTRIM(acs.CUSTGROUPCODE)) <> ''
 
-    WHERE pf.PROD_CATEGORY IS NOT NULL
+    WHERE pfi.PROD_CATEGORY IS NOT NULL
+       OR pfs.PROD_CATEGORY IS NOT NULL
        OR cp.PROD_CATEGORY IS NOT NULL
        OR ci.CUSTID IS NOT NULL
        OR gp.CUSTGROUPCODE IS NOT NULL
