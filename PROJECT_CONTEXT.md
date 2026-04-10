@@ -245,24 +245,27 @@ SharedCatalogs AS (
     SELECT DISTINCT
         'SHARED' as CatalogType,
         CONCAT(
-            LTRIM(RTRIM(ISNULL(c.CUSTCATEGORY, ''))), '|',
+            LTRIM(RTRIM(ISNULL(cg.CATGOR_CATALOG_ROLLUP, ''))), '|',
             LTRIM(RTRIM(ISNULL(c.CUSTPRICETIER, '0'))), '|',
             CAST(ISNULL(c.CUSTPRICEMARKUP, 0) AS VARCHAR(20)), '|',
             LTRIM(RTRIM(ISNULL(c.CUSTGROUPCODE, ''))), '|',
             '0'
         ) as UniqueKey,
         NULL as CUSTID,
-        LTRIM(RTRIM(ISNULL(c.CUSTCATEGORY, ''))) AS CUSTCATEGORY,
+        LTRIM(RTRIM(ISNULL(cg.CATGOR_CATALOG_ROLLUP, ''))) AS CATGOR_CATALOG_ROLLUP,
         LTRIM(RTRIM(ISNULL(c.CUSTPRICETIER, '0'))) AS CUSTPRICETIER,
         ISNULL(c.CUSTPRICEMARKUP, 0) AS CUSTPRICEMARKUP,
         LTRIM(RTRIM(ISNULL(c.CUSTGROUPCODE, ''))) AS CUSTGROUPCODE,
         0 AS IS_MEMBER_NULL
     FROM dbo.cust c
+    INNER JOIN dbo.CATGOR cg
+        ON LTRIM(RTRIM(cg.CATGOR_OLD_CATEGORY)) = LTRIM(RTRIM(c.CUSTCATEGORY))
     LEFT JOIN CustomersWithIndividualPricing ci ON c.CUSTID = ci.CUSTID
     WHERE c.CUSTID IS NOT NULL
         AND ci.CUSTID IS NULL
         AND LTRIM(RTRIM(ISNULL(c.CUSTCATEGORY, ''))) <> ''
         AND c.CUSTMEMBERNUM IS NOT NULL
+        AND LTRIM(RTRIM(ISNULL(cg.CATGOR_CATALOG_ROLLUP, ''))) <> ''
 ),
 ProductCategories AS (
     SELECT DISTINCT LTRIM(RTRIM(PRICAT_CATEGORY)) AS PROD_CATEGORY
@@ -277,6 +280,7 @@ AllCatalogs AS (
         ic.UniqueKey,
         ic.CUSTID,
         ic.CUSTCATEGORY,
+        NULL AS CATGOR_CATALOG_ROLLUP,
         ic.CUSTPRICETIER,
         ic.CUSTPRICEMARKUP,
         ic.CUSTGROUPCODE,
@@ -289,7 +293,8 @@ AllCatalogs AS (
         sc.CatalogType,
         sc.UniqueKey,
         sc.CUSTID,
-        sc.CUSTCATEGORY,
+        NULL AS CUSTCATEGORY,
+        sc.CATGOR_CATALOG_ROLLUP,
         sc.CUSTPRICETIER,
         sc.CUSTPRICEMARKUP,
         sc.CUSTGROUPCODE,
@@ -466,7 +471,7 @@ Similar to the query for Individual catalogs bot doesn't consider special prices
 
 **Query:**
 ```sql
-DECLARE @CustomerCategory VARCHAR(10) = {{record.CUSTCATEGORY}};
+DECLARE @RollupCode VARCHAR(10) = {{record.CATGOR_CATALOG_ROLLUP}};
 DECLARE @CustomerTier VARCHAR(10) = {{record.CUSTPRICETIER}};
 DECLARE @CustomerMarkup DECIMAL(10,4) = {{record.CUSTPRICEMARKUP}};
 DECLARE @CustomerGroupCode VARCHAR(50) = {{record.CUSTGROUPCODE}};
@@ -476,9 +481,15 @@ DECLARE @ProductCategory VARCHAR(50) = {{record.PROD_CATEGORY}};
 DECLARE @EffectiveGroupCode VARCHAR(50);
 DECLARE @EffectiveCategory VARCHAR(10);
 
+-- Get representative category from CATGOR for markup lookup
+-- All categories in the same rollup group have identical markups (by design)
+SELECT TOP 1 @EffectiveCategory = LTRIM(RTRIM(CATGOR_OLD_CATEGORY))
+FROM dbo.CATGOR WITH (NOLOCK)
+WHERE LTRIM(RTRIM(CATGOR_CATALOG_ROLLUP)) = @RollupCode;
+
 IF @IsMemberNull = 1 
    OR (
-       (LTRIM(RTRIM(@CustomerCategory)) = '' OR @CustomerCategory IS NULL)
+       (@EffectiveCategory IS NULL OR LTRIM(RTRIM(@EffectiveCategory)) = '')
        AND (LTRIM(RTRIM(@CustomerGroupCode)) = '' OR @CustomerGroupCode IS NULL)
    )
 BEGIN
@@ -488,7 +499,7 @@ END
 ELSE
 BEGIN
     SET @EffectiveGroupCode = ISNULL(@CustomerGroupCode, '');
-    SET @EffectiveCategory = ISNULL(NULLIF(LTRIM(RTRIM(@CustomerCategory)), ''), 'WP2');
+    SET @EffectiveCategory = ISNULL(NULLIF(LTRIM(RTRIM(@EffectiveCategory)), ''), 'WP2');
 END;
 
 WITH ProductsWithWH1 AS (
@@ -963,10 +974,11 @@ SKU      → PATH B (Specific SKUs Only — all other changes)
 
 | Parameter | Where Used | Purpose |
 |-----------|------------|---------|
-| **CUSTCATEGORY** | PRICE table lookup | Gets base markup: `price_cust_cat = CUSTCATEGORY` |
+| **CUSTCATEGORY** | Individual catalogs only | Still used directly for PRICE table lookup in Individual product data queries |
+| **CATGOR_CATALOG_ROLLUP** | Shared catalogs — catalog identity | Replaces CUSTCATEGORY as catalog key for shared catalogs; used to look up representative category via CATGOR for PRICE table |
 | **CUSTPRICETIER** | Column selection | Selects which markup column: `PRICE_MARKUP{tier}` |
 | **CUSTPRICEMARKUP** | Adjustment | Added to base markup: `markup + (CUSTPRICEMARKUP × 100)` |
-| **CUSTGROUPCODE** | GP special prices | Lookup: `SPECPR_TYPE='GP' AND SPECPR_KEY = CUSTGROUPCODE` |
+| **CUSTGROUPCODE** | GP special prices + catalog key | Lookup: `SPECPR_TYPE='GP' AND SPECPR_KEY = CUSTGROUPCODE`; also part of shared catalog unique key |
 | **CUSTID** | CI special prices | Lookup: `SPECPR_TYPE='CI' AND SPECPR_KEY = CUSTID` |
 | **PROD_CATEGORY** | Product filter | Filters products and PRICE lookup: `PRICE_PROD_CAT = PROD_CATEGORY` |
 | **IS_MEMBER_NULL** | QuickBuy mode | If 1 → skip special pricing (not used in update flow) |

@@ -12,11 +12,11 @@ The original shared catalog design created one catalog per unique combination of
 
 | Type | Count | Description |
 |------|-------|-------------|
-| **Rollup Shared (C01–C05)** | 5 groups × 8 tiers × N distinct CUSTPRICEMARKUP values | Standard 8-tier pricing, each group covers multiple CUSTCATEGORY values with identical markups |
-| **Rollup Shared (R01)** | N distinct CUSTPRICEMARKUP values | Single-tier only, uses `PRICE_DEFAULT_LEVEL` for markup lookup |
+| **Rollup Shared (C01–C05)** | 5 groups × 8 tiers × N distinct CUSTPRICEMARKUP/CUSTGROUPCODE combinations | Standard 8-tier pricing, each group covers multiple CUSTCATEGORY values with identical markups |
+| **Rollup Shared (R01)** | N distinct CUSTPRICEMARKUP/CUSTGROUPCODE combinations | Single-tier only, uses `PRICE_DEFAULT_LEVEL` for markup lookup |
 | **Individual** | ~200–300 | Unchanged — one per customer with active CI special pricing |
 
-**Total shared catalogs:** Significantly fewer than ~800–900, but exact count depends on how many distinct `CUSTPRICEMARKUP` values exist across shared customers. Each unique `CATGOR_CATALOG_ROLLUP | CUSTPRICETIER | CUSTPRICEMARKUP` combination is one catalog.
+**Total shared catalogs:** Significantly fewer than ~800–900, but exact count depends on distinct `CUSTPRICEMARKUP` and `CUSTGROUPCODE` combinations across shared customers. Each unique `CATGOR_CATALOG_ROLLUP | CUSTPRICETIER | CUSTPRICEMARKUP | CUSTGROUPCODE` combination is one catalog.
 
 ---
 
@@ -50,17 +50,18 @@ This table is the source of truth for the rollup mapping.
 ## Catalog Unique Key (Rollup Shared)
 
 ```
-CATGOR_CATALOG_ROLLUP | CUSTPRICETIER | CUSTPRICEMARKUP
+CATGOR_CATALOG_ROLLUP | CUSTPRICETIER | CUSTPRICEMARKUP | CUSTGROUPCODE
 ```
 
 - **`CATGOR_CATALOG_ROLLUP`** — the rolled-up catalog group (C01–C05, R01)
 - **`CUSTPRICETIER`** — the customer's pricing tier (1–8 for C-catalogs; uses `PRICE_DEFAULT_LEVEL` for R01)
-- **`CUSTPRICEMARKUP`** — per-customer markup adjustment; still used and still creates separate catalog variants when non-zero
+- **`CUSTPRICEMARKUP`** — per-customer markup adjustment; creates separate catalog variants when non-zero
+- **`CUSTGROUPCODE`** — buying group code; retained because it affects GP special pricing (two customers with different group codes get different prices for the same SKU)
 
 Each Celigo flow still processes one product category at a time to stay within timeout limits, so the processing key is effectively:
 
 ```
-CATGOR_CATALOG_ROLLUP | CUSTPRICETIER | CUSTPRICEMARKUP | PROD_CATEGORY
+CATGOR_CATALOG_ROLLUP | CUSTPRICETIER | CUSTPRICEMARKUP | CUSTGROUPCODE | PROD_CATEGORY
 ```
 
 ---
@@ -100,10 +101,10 @@ Customers are assigned to a rollup catalog based on:
 
 1. **Look up their `CUSTCATEGORY`** in the `CATGOR` table via `CATGOR_OLD_CATEGORY`
 2. **Read `CATGOR_CATALOG_ROLLUP`** → this is their catalog group
-3. **Combine with `CUSTPRICETIER` and `CUSTPRICEMARKUP`** → this identifies their specific catalog within the group
+3. **Combine with `CUSTPRICETIER`, `CUSTPRICEMARKUP`, and `CUSTGROUPCODE`** → this identifies their specific catalog
 
 ```sql
-SELECT c.CUSTID, c.CUSTPRICETIER, c.CUSTPRICEMARKUP, cg.CATGOR_CATALOG_ROLLUP
+SELECT c.CUSTID, c.CUSTPRICETIER, c.CUSTPRICEMARKUP, c.CUSTGROUPCODE, cg.CATGOR_CATALOG_ROLLUP
 FROM dbo.cust c
 JOIN dbo.CATGOR cg
   ON LTRIM(RTRIM(cg.CATGOR_OLD_CATEGORY)) = LTRIM(RTRIM(c.CUSTCATEGORY))
@@ -123,9 +124,9 @@ The Customer Sync Flow uses this lookup to determine catalog assignment and hand
 - **Product category chunking:** Still required per Celigo flow limits
 
 ### Changed
-- **Catalog identity:** No longer `CUSTCATEGORY|CUSTPRICETIER|CUSTPRICEMARKUP|...` — now `CATGOR_CATALOG_ROLLUP|CUSTPRICETIER|CUSTPRICEMARKUP`
+- **Catalog identity:** No longer `CUSTCATEGORY|CUSTPRICETIER|CUSTPRICEMARKUP|CUSTGROUPCODE|0` — now `CATGOR_CATALOG_ROLLUP|CUSTPRICETIER|CUSTPRICEMARKUP|CUSTGROUPCODE`
 - **Markup source:** Looked up via a representative category from `CATGOR` instead of directly from `CUSTCATEGORY`
-- **Catalog count:** Significantly reduced from ~800–900 shared (exact new count depends on distinct CUSTPRICEMARKUP values across shared customers)
+- **Catalog count:** Significantly reduced from ~800–900 shared (exact count depends on distinct CUSTPRICEMARKUP/CUSTGROUPCODE combinations)
 
 ---
 
@@ -134,7 +135,7 @@ The Customer Sync Flow uses this lookup to determine catalog assignment and hand
 ### Customer Sync Flow
 - Must now look up `CATGOR_CATALOG_ROLLUP` via `CATGOR` table to determine catalog assignment
 - Catalog type determination: Individual if active CI pricing exists; otherwise Shared (rollup)
-- Catalog title used as unique identifier: `C01-T1-PM<CUSTPRICEMARKUP>`
+- Catalog title used as unique identifier: `C01-T1-PM<CUSTPRICEMARKUP>-<CUSTGROUPCODE>`
 
 ### Flow 2 (Populate New Catalogs)
 - Detects newly created rollup catalogs
@@ -142,9 +143,9 @@ The Customer Sync Flow uses this lookup to determine catalog assignment and hand
 - Uses representative category for markup lookup (via CATGOR)
 
 ### Flow 3 (Update Existing Catalog Prices)
-- Delta detection query must map changed categories to their rollup group
+- Delta detection query must map changed categories to their rollup group via CATGOR
 - UpdateScope (CATEGORY / SKU) logic unchanged
-- Processing key: `CATGOR_CATALOG_ROLLUP | CUSTPRICETIER | CUSTPRICEMARKUP | PROD_CATEGORY`
+- Processing key: `CATGOR_CATALOG_ROLLUP | CUSTPRICETIER | CUSTPRICEMARKUP | CUSTGROUPCODE | PROD_CATEGORY`
 
 ---
 
@@ -153,15 +154,15 @@ The Customer Sync Flow uses this lookup to determine catalog assignment and hand
 Rollup shared catalog titles serve as both the display name and the unique identifier:
 
 ```
-C0<rollup_number>-T<tier_number>-PM<custpricemarkup>
+C0<rollup_number>-T<tier_number>-PM<custpricemarkup>-<custgroupcode>
 ```
 
 **Examples:**
-- `C01-T1-PM0` — Rollup group C01, tier 1, no markup adjustment
-- `C03-T4-PM0.5` — Rollup group C03, tier 4, +0.5 markup adjustment
-- `C05-T8-PM0` — Rollup group C05, tier 8, no markup adjustment
+- `C01-T1-PM0-IHU` — Rollup group C01, tier 1, no markup adjustment, group IHU
+- `C03-T4-PM0.5-IHU` — Rollup group C03, tier 4, +0.5 markup adjustment, group IHU
+- `C05-T8-PM0-` — Rollup group C05, tier 8, no markup, no group code (empty string)
 
-R01 title format follows the same suffix pattern: `R01-PM<CUSTPRICEMARKUP>` (e.g., `R01-PM0`).
+R01 title format follows the same suffix pattern: `R01-PM<CUSTPRICEMARKUP>-<CUSTGROUPCODE>` (e.g., `R01-PM0-IHU`).
 
 Individual catalog titles remain unchanged: `CUST-{CUSTID}`
 
