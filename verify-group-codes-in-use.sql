@@ -1,0 +1,100 @@
+-- Verify if "extra" group codes are actually in use by customers
+
+WITH CustomersWithIndividualPricing AS (
+    SELECT DISTINCT sp.SPECPR_KEY AS CUSTID
+    FROM dbo.specpr sp
+    WHERE sp.SPECPR_TYPE = 'CI'
+        AND sp.SPECPR_APPROVER IS NOT NULL
+        AND LTRIM(RTRIM(sp.SPECPR_APPROVER)) <> ''
+        AND sp.SPECPR_EXPIRE_DATE > GETDATE()
+),
+-- Customers matched with OLD field
+CustomersMatchedWithOLD AS (
+    SELECT DISTINCT
+        c.CUSTID,
+        LTRIM(RTRIM(c.CUSTGROUPCODE)) AS CUSTGROUPCODE,
+        LTRIM(RTRIM(c.CUSTCATEGORY)) AS CUSTCATEGORY,
+        LTRIM(RTRIM(cg.CATGOR_CATALOG_ROLLUP)) AS CATGOR_CATALOG_ROLLUP
+    FROM dbo.cust c
+    INNER JOIN dbo.CATGOR cg WITH (NOLOCK)
+        ON LTRIM(RTRIM(cg.CATGOR_OLD_CATEGORY)) = LTRIM(RTRIM(c.CUSTCATEGORY))
+    LEFT JOIN CustomersWithIndividualPricing ci ON c.CUSTID = ci.CUSTID
+    WHERE c.CUSTID IS NOT NULL
+        AND ci.CUSTID IS NULL
+        AND LTRIM(RTRIM(ISNULL(c.CUSTCATEGORY, ''))) <> ''
+        AND c.CUSTMEMBERNUM IS NOT NULL
+        AND LTRIM(RTRIM(ISNULL(cg.CATGOR_CATALOG_ROLLUP, ''))) <> ''
+        AND LTRIM(RTRIM(ISNULL(c.CUSTGROUPCODE, ''))) <> ''
+),
+-- Customers matched with NEW field
+CustomersMatchedWithNEW AS (
+    SELECT DISTINCT
+        c.CUSTID,
+        LTRIM(RTRIM(c.CUSTGROUPCODE)) AS CUSTGROUPCODE,
+        LTRIM(RTRIM(c.CUSTCATEGORY)) AS CUSTCATEGORY,
+        LTRIM(RTRIM(cg.CATGOR_CATALOG_ROLLUP)) AS CATGOR_CATALOG_ROLLUP
+    FROM dbo.cust c
+    INNER JOIN dbo.CATGOR cg WITH (NOLOCK)
+        ON LTRIM(RTRIM(cg.CATGOR_CODE)) = LTRIM(RTRIM(c.CUSTCATEGORY))
+    LEFT JOIN CustomersWithIndividualPricing ci ON c.CUSTID = ci.CUSTID
+    WHERE c.CUSTID IS NOT NULL
+        AND ci.CUSTID IS NULL
+        AND LTRIM(RTRIM(ISNULL(c.CUSTCATEGORY, ''))) <> ''
+        AND c.CUSTMEMBERNUM IS NOT NULL
+        AND LTRIM(RTRIM(ISNULL(cg.CATGOR_CATALOG_ROLLUP, ''))) <> ''
+        AND LTRIM(RTRIM(ISNULL(c.CUSTGROUPCODE, ''))) <> ''
+)
+
+-- Summary comparison
+SELECT
+    'CATGOR_OLD_CATEGORY' AS Method,
+    COUNT(DISTINCT CUSTID) AS UniqueCustomers,
+    COUNT(DISTINCT CUSTGROUPCODE) AS UniqueGroupCodes,
+    COUNT(DISTINCT CONCAT(CATGOR_CATALOG_ROLLUP, '|', CUSTGROUPCODE)) AS UniqueCatalogCombinations
+FROM CustomersMatchedWithOLD
+
+UNION ALL
+
+SELECT
+    'CATGOR_CODE' AS Method,
+    COUNT(DISTINCT CUSTID) AS UniqueCustomers,
+    COUNT(DISTINCT CUSTGROUPCODE) AS UniqueGroupCodes,
+    COUNT(DISTINCT CONCAT(CATGOR_CATALOG_ROLLUP, '|', CUSTGROUPCODE)) AS UniqueCatalogCombinations
+FROM CustomersMatchedWithNEW;
+
+-- Show customers that ONLY match with CATGOR_CODE (not with OLD)
+SELECT
+    'Customers ONLY in CATGOR_CODE' AS Category,
+    n.CUSTID,
+    n.CUSTCATEGORY,
+    n.CUSTGROUPCODE,
+    n.CATGOR_CATALOG_ROLLUP
+FROM CustomersMatchedWithNEW n
+LEFT JOIN CustomersMatchedWithOLD o ON n.CUSTID = o.CUSTID
+WHERE o.CUSTID IS NULL
+ORDER BY n.CATGOR_CATALOG_ROLLUP, n.CUSTGROUPCODE, n.CUSTID;
+
+-- Show group codes that ONLY appear with CATGOR_CODE
+SELECT
+    'Group codes ONLY in CATGOR_CODE' AS Category,
+    CUSTGROUPCODE,
+    COUNT(DISTINCT CUSTID) AS CustomerCount,
+    COUNT(DISTINCT CATGOR_CATALOG_ROLLUP) AS RollupCount
+FROM CustomersMatchedWithNEW
+WHERE CUSTGROUPCODE NOT IN (SELECT DISTINCT CUSTGROUPCODE FROM CustomersMatchedWithOLD)
+GROUP BY CUSTGROUPCODE
+ORDER BY CustomerCount DESC, CUSTGROUPCODE;
+
+-- Verify: Are there actual customers with these group codes?
+SELECT
+    'All customers with group codes (from cust table)' AS Source,
+    LTRIM(RTRIM(c.CUSTGROUPCODE)) AS CUSTGROUPCODE,
+    COUNT(DISTINCT c.CUSTID) AS CustomerCount
+FROM dbo.cust c
+LEFT JOIN CustomersWithIndividualPricing ci ON c.CUSTID = ci.CUSTID
+WHERE c.CUSTID IS NOT NULL
+    AND ci.CUSTID IS NULL
+    AND c.CUSTMEMBERNUM IS NOT NULL
+    AND LTRIM(RTRIM(ISNULL(c.CUSTGROUPCODE, ''))) <> ''
+GROUP BY LTRIM(RTRIM(c.CUSTGROUPCODE))
+ORDER BY CustomerCount DESC, CUSTGROUPCODE;
