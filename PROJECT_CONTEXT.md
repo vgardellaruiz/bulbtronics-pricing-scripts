@@ -806,16 +806,17 @@ WHERE sp.SPECPR_TYPE = 'GP'
 
 ## Catalog Rollup Queries
 
-### Empty Catalog Creation Query (Base + Buying Group Catalogs Only)
+### Empty Catalog Creation Query (Complete)
 
-This query creates the shared catalog structure using the CATGOR rollup strategy:
+This query creates all three catalog types using the CATGOR rollup strategy:
 - **41 Base Catalogs**: Always created (C01-C05 × T1-8 + R01-T1) with empty CUSTGROUPCODE
 - **Buying Group Catalogs**: Only created for (rollup + tier + group) combinations that exist in customer data
+- **Individual Catalogs**: Created for all customers with active CI special pricing
 
 **Important Notes:**
 - Tier 0 is converted to Tier 1
-- CUSTPRICEMARKUP is always set to 0 in catalog keys
-- Individual catalogs are handled separately and should be added via UNION
+- CUSTPRICEMARKUP is always set to 0 in shared catalog keys (base + buying group)
+- Individual catalogs use actual CUSTPRICEMARKUP values
 - Uses CATGOR_OLD_CATEGORY for customer category mapping (to be updated to CATGOR_CODE)
 
 ```sql
@@ -846,20 +847,18 @@ MandatoryBaseCatalogs AS (
     UNION ALL
     SELECT 'R01', '1'
 ),
--- Base catalogs (41 total, no group code, always created)
 BaseCatalogs AS (
     SELECT
         'SHARED' AS CatalogType,
         CONCAT(mbc.CATGOR_CATALOG_ROLLUP, '|', mbc.CUSTPRICETIER, '|0||0') AS UniqueKey,
-        mbc.CATGOR_CATALOG_ROLLUP AS CATGOR_CATALOG_ROLLUP,
-        mbc.CUSTPRICETIER AS CUSTPRICETIER,
+        mbc.CATGOR_CATALOG_ROLLUP,
+        mbc.CUSTPRICETIER,
         0 AS CUSTPRICEMARKUP,
         '' AS CUSTGROUPCODE,
         0 AS IS_MEMBER_NULL,
         CONCAT(mbc.CATGOR_CATALOG_ROLLUP, '-T', mbc.CUSTPRICETIER, '-PM0') AS catalogTitle
     FROM MandatoryBaseCatalogs mbc
 ),
--- Buying group catalogs (tier 0 → tier 1, ALL CUSTPRICEMARKUP values)
 BuyingGroupCatalogs AS (
     SELECT DISTINCT
         'SHARED' AS CatalogType,
@@ -877,30 +876,49 @@ BuyingGroupCatalogs AS (
         0 AS IS_MEMBER_NULL,
         CONCAT(
             LTRIM(RTRIM(cg.CATGOR_CATALOG_ROLLUP)), '-T',
-            CASE WHEN ISNULL(c.CUSTPRICETIER, 0) = 0 THEN '1' ELSE LTRIM(RTRIM(c.CUSTPRICETIER)) END, '-PM0-',
+            CASE WHEN ISNULL(c.CUSTPRICETIER, 0) = 0 THEN '1' ELSE LTRIM(RTRIM(c.CUSTPRICETIER)) END,
+            '-PM0-',
             LTRIM(RTRIM(c.CUSTGROUPCODE))
         ) AS catalogTitle
     FROM dbo.cust c
     INNER JOIN dbo.CATGOR cg WITH (NOLOCK)
         ON LTRIM(RTRIM(cg.CATGOR_OLD_CATEGORY)) = LTRIM(RTRIM(c.CUSTCATEGORY))
-    LEFT JOIN CustomersWithIndividualPricing ci ON c.CUSTID = ci.CUSTID
+    LEFT JOIN CustomersWithIndividualPricing ci 
+        ON c.CUSTID = ci.CUSTID
     WHERE c.CUSTID IS NOT NULL
         AND ci.CUSTID IS NULL
         AND LTRIM(RTRIM(ISNULL(c.CUSTCATEGORY, ''))) <> ''
         AND c.CUSTMEMBERNUM IS NOT NULL
         AND LTRIM(RTRIM(ISNULL(cg.CATGOR_CATALOG_ROLLUP, ''))) <> ''
         AND LTRIM(RTRIM(ISNULL(c.CUSTGROUPCODE, ''))) <> ''
-        -- REMOVED: AND ISNULL(c.CUSTPRICEMARKUP, 0) = 0
+),
+IndividualCatalogs AS (
+    SELECT
+        'INDIVIDUAL' AS CatalogType,
+        c.CUSTID AS UniqueKey,
+        NULL AS CATGOR_CATALOG_ROLLUP,
+        LTRIM(RTRIM(ISNULL(c.CUSTPRICETIER, '0'))) AS CUSTPRICETIER,
+        ISNULL(c.CUSTPRICEMARKUP, 0) AS CUSTPRICEMARKUP,
+        LTRIM(RTRIM(ISNULL(c.CUSTGROUPCODE, ''))) AS CUSTGROUPCODE,
+        0 AS IS_MEMBER_NULL,
+        CONCAT('CUST-', c.CUSTID) AS catalogTitle
+    FROM dbo.cust c
+    INNER JOIN CustomersWithIndividualPricing ci
+        ON c.CUSTID = ci.CUSTID
+    WHERE c.CUSTID IS NOT NULL
+        AND LTRIM(RTRIM(ISNULL(c.CUSTCATEGORY, ''))) <> ''
+        AND c.CUSTMEMBERNUM IS NOT NULL
 )
 SELECT * FROM BaseCatalogs
 UNION
 SELECT * FROM BuyingGroupCatalogs
-ORDER BY CATGOR_CATALOG_ROLLUP, CUSTPRICETIER, CUSTPRICEMARKUP, CUSTGROUPCODE;
+UNION
+SELECT * FROM IndividualCatalogs
+ORDER BY CatalogType DESC, CATGOR_CATALOG_ROLLUP, CUSTPRICETIER, CUSTPRICEMARKUP, CUSTGROUPCODE;
 ```
 
 **TODO:** 
 - Add representative CUSTCATEGORY field for price calculations
-- Add IndividualCatalogs CTE and UNION
 - Update to use CATGOR_CODE instead of CATGOR_OLD_CATEGORY
 
 ---
